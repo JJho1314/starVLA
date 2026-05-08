@@ -1366,15 +1366,60 @@ class LeRobotSingleDataset(Dataset):
         trajectory_id, base_index = self.all_steps[index]
         raw_data = self.get_step_data(trajectory_id, base_index)
         data = self.transforms(raw_data)
+
+        # Optionally derive `action_is_pad` / `image_is_pad` from how `step_indices`
+        # were clipped at episode boundaries (matches FastWAM's processor masks).
+        # Off by default — only WanFastWAM-aligned setup needs it.
+        if self.data_cfg is not None and bool(self.data_cfg.get("emit_is_pad", False)):
+            traj_idx = self.get_trajectory_index(trajectory_id)
+            traj_len = int(self.trajectory_lengths[traj_idx])
+
+            def _is_pad_for(modality: str):
+                keys = self.modality_keys.get(modality, [])
+                if not keys:
+                    return None
+                first_key = keys[0]
+                deltas = self.delta_indices.get(first_key)
+                if deltas is None:
+                    return None
+                desired = np.asarray(deltas, dtype=np.int64) + int(base_index)
+                clipped = np.clip(desired, 0, traj_len - 1)
+                return (desired != clipped).astype(np.bool_)
+
+            action_pad = _is_pad_for("action")
+            video_pad = _is_pad_for("video")
+            if action_pad is not None:
+                data["action_is_pad"] = action_pad
+            if video_pad is not None:
+                data["image_is_pad"] = video_pad
+
         return self._pack_sample(data)
 
     def _pack_sample(self, data: dict) -> dict:
-        """Pack transformed modality data into training sample format."""
+        """Pack transformed modality data into training sample format.
+
+        `data_cfg.multi_frame_video=true` (default false) emits per-cam list of T PIL frames
+        instead of a single PIL per cam. Required by WanFastWAM-style training that loads
+        multiple video timesteps per sample (matches FastWAM `num_frames=33,
+        action_video_freq_ratio=4`). Backward-compatible: when off (default), behavior is
+        unchanged for all existing single-frame consumers.
+        """
+        multi_frame = bool(self.data_cfg.get("multi_frame_video", False)) if self.data_cfg else False
+
         step_images = []
         for video_key in self.modality_keys["video"]:
-            image = data[video_key][0]
-            image = Image.fromarray(image).resize((224, 224))
-            step_images.append(image)
+            video_arr = data[video_key]   # [T, H, W, C] uint8
+            if multi_frame and video_arr.shape[0] > 1:
+                # Per-cam list of T PIL frames (consumer must do per-frame cam-concat itself).
+                frames = [
+                    Image.fromarray(video_arr[t]).resize((224, 224))
+                    for t in range(video_arr.shape[0])
+                ]
+                step_images.append(frames)
+            else:
+                # Single-frame path (legacy, used by all VLM4A models + single-obs MoT setups).
+                image = Image.fromarray(video_arr[0]).resize((224, 224))
+                step_images.append(image)
 
         language = data[self.modality_keys["language"][0]][0]
         action = []
@@ -1395,6 +1440,12 @@ class LeRobotSingleDataset(Dataset):
                 state.append(data[state_key])
             state = np.concatenate(state, axis=1).astype(np.float16)
             sample["state"] = state
+
+        # Forward optional pad masks built in __getitem__ (gated by data_cfg.emit_is_pad).
+        if "action_is_pad" in data:
+            sample["action_is_pad"] = data["action_is_pad"]
+        if "image_is_pad" in data:
+            sample["image_is_pad"] = data["image_is_pad"]
 
         return sample
 

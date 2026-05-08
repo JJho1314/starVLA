@@ -12,6 +12,7 @@ Conventions:
 
 # Standard Library
 import argparse
+import contextlib
 import json
 import os
 import time
@@ -73,6 +74,37 @@ def prepare_data(cfg, accelerator, output_dir) -> DataLoader:
     accelerator.dataloader_config.dispatch_batches = False
     dist.barrier()
     return vla_train_dataloader
+
+
+def _derive_max_steps_from_epochs(cfg, vla_train_dataloader, accelerator) -> None:
+    """If `cfg.trainer.num_epochs` is set (>0), derive `cfg.trainer.max_train_steps`
+    from it (FastWAM-style). Otherwise leave `max_train_steps` unchanged.
+
+    optimizer steps per epoch = len(dataloader) / (world_size × grad_accum)
+    Note: at this point the dataloader has not been `accelerator.prepare`-d yet,
+    so `len(dataloader)` is the unsharded count over the global dataset.
+    """
+    raw = getattr(cfg.trainer, "num_epochs", None)
+    try:
+        num_epochs = float(raw) if raw is not None else None
+    except (TypeError, ValueError):
+        num_epochs = None
+    if num_epochs is None or num_epochs <= 0:
+        return
+
+    world_size = max(1, int(getattr(accelerator, "num_processes", 1)))
+    grad_accum = max(1, int(getattr(cfg.trainer, "gradient_accumulation_steps", 1)))
+    n_batches = len(vla_train_dataloader)
+    steps_per_epoch = max(1, n_batches // (world_size * grad_accum))
+    derived = int(round(num_epochs * steps_per_epoch))
+
+    old = getattr(cfg.trainer, "max_train_steps", None)
+    cfg.trainer.max_train_steps = derived
+    logger.info(
+        f"[epochs] num_epochs={num_epochs} world_size={world_size} grad_accum={grad_accum} "
+        f"len(dataloader)={n_batches} -> steps_per_epoch={steps_per_epoch} "
+        f"-> max_train_steps={derived} (was {old})"
+    )
 
 
 def setup_optimizer_and_scheduler(model, cfg) -> Tuple[torch.optim.Optimizer, torch.optim.lr_scheduler._LRScheduler]:
@@ -304,9 +336,12 @@ class VLATrainer(TrainerUtils):
             step_metrics = self._train_step(batch_vla)
             t_end_model = time.perf_counter()
 
-            if self.accelerator.sync_gradients:
-                progress_bar.update(1)
-                self.completed_steps += 1
+            # When DeepSpeed bypasses `accelerator.accumulate`, sync_gradients
+            # stays True every micro-batch — use the manual flag set inside
+            # `_train_step` instead, falling back to accelerator for non-DS.
+            sync = getattr(self, "_last_was_sync_step", None)
+            if sync is None:
+                sync = self.accelerator.sync_gradients
 
             if self.accelerator.is_local_main_process:
                 progress_bar.set_postfix(
@@ -316,18 +351,30 @@ class VLATrainer(TrainerUtils):
                     }
                 )
 
-            if self.completed_steps % self.config.trainer.eval_interval == 0:
-                step_metrics = self.eval_action_model(step_metrics)
+            # All per-optimizer-step bookkeeping (counter increment, eval, log,
+            # save, max-steps check) must be gated by `sync`. Otherwise, with DS
+            # grad_accum > 1 and `completed_steps == 0`, eval/log fire every
+            # micro-batch (since `0 % anything == 0`) and the loop livelocks.
+            if sync:
+                # Step the LR scheduler exactly once per optimizer update so the
+                # cosine schedule covers `max_train_steps` optimizer steps, not
+                # `grad_accum * max_train_steps` micro-batches.
+                self.lr_scheduler.step()
+                progress_bar.update(1)
+                self.completed_steps += 1
 
-            step_metrics["data_time"] = t_end_data - t_start_data
-            step_metrics["model_time"] = t_end_model - t_start_model
-            self._log_metrics(step_metrics)
+                if self.completed_steps % self.config.trainer.eval_interval == 0:
+                    step_metrics = self.eval_action_model(step_metrics)
 
-            if self.completed_steps % self.config.trainer.save_interval == 0 and self.completed_steps > 0:
-                self._save_checkpoint()
+                step_metrics["data_time"] = t_end_data - t_start_data
+                step_metrics["model_time"] = t_end_model - t_start_model
+                self._log_metrics(step_metrics)
 
-            if self.completed_steps >= self.config.trainer.max_train_steps:
-                break
+                if self.completed_steps % self.config.trainer.save_interval == 0 and self.completed_steps > 0:
+                    self._save_checkpoint()
+
+                if self.completed_steps >= self.config.trainer.max_train_steps:
+                    break
 
         self._finalize_training()
 
@@ -359,15 +406,65 @@ class VLATrainer(TrainerUtils):
             logger.info(f"  Gradient accumulation steps = {self.accelerator.gradient_accumulation_steps}")
             logger.info(f"  Total batch size = {self.total_batch_size}")
 
+        # Hard-fail if grad_accum disagrees across config/accelerator/DeepSpeed —
+        # this is the kind of mismatch that silently halves effective batch and
+        # was costly to diagnose. Run on every rank.
+        cfg_ga = int(getattr(self.config.trainer, "gradient_accumulation_steps", 1))
+        acc_ga = int(self.accelerator.gradient_accumulation_steps)
+        if cfg_ga != acc_ga:
+            raise RuntimeError(
+                f"gradient_accumulation_steps mismatch: trainer config={cfg_ga} "
+                f"vs accelerator={acc_ga}. Ensure `--gradient_accumulation_steps {cfg_ga}` "
+                f"is passed to `accelerate launch` and ds_config has `auto`."
+            )
+        try:
+            from accelerate.utils import DistributedType
+            if self.accelerator.distributed_type == DistributedType.DEEPSPEED:
+                ds_plugin = getattr(self.accelerator.state, "deepspeed_plugin", None)
+                if ds_plugin is not None:
+                    ds_ga = int(ds_plugin.deepspeed_config.get("gradient_accumulation_steps", -1))
+                    if ds_ga != cfg_ga:
+                        raise RuntimeError(
+                            f"DeepSpeed gradient_accumulation_steps={ds_ga} != trainer "
+                            f"config={cfg_ga}. Check ds_config gradient_accumulation_steps "
+                            f"resolves to `auto` and accelerate launch propagates the value."
+                        )
+        except ImportError:
+            pass
+
     def _train_step(self, batch_vla, batch_vlm=None):
-        """Execute single training step."""
-        with self.accelerator.accumulate(self.model):
+        """Execute single training step.
+
+        `accelerator.accumulate(model)` calls `model.no_sync()` for non-sync
+        micro-batches, which raises `AssertionError: no_sync context manager
+        is incompatible with gradient partitioning logic of ZeRO stage 2`.
+        DeepSpeed engine already handles gradient accumulation internally —
+        backward accumulates, optimizer.step() is a no-op except on the
+        accumulation boundary — so we just skip the accelerate context for DS.
+
+        When we skip `accumulate()`, `accelerator.sync_gradients` is no longer
+        toggled, so we maintain our own micro-step counter and expose
+        `self._last_was_sync_step` for the train loop to gate `completed_steps`.
+        """
+        from accelerate.utils import DistributedType
+        is_deepspeed = self.accelerator.distributed_type == DistributedType.DEEPSPEED
+        if is_deepspeed:
+            accumulate_ctx = contextlib.nullcontext()
+        else:
+            accumulate_ctx = self.accelerator.accumulate(self.model)
+        with accumulate_ctx:
             self.optimizer.zero_grad()
 
             with torch.autocast("cuda", dtype=torch.bfloat16):
                 output_dict = self.model.forward(batch_vla)
                 action_loss = output_dict["action_loss"]
-                total_loss = action_loss
+                # Sum every *_loss tensor in the output dict (e.g. "video_loss"
+                # for FastWAM-style auxiliary supervision). Frameworks should
+                # already apply their own lambda weights before returning.
+                total_loss = sum(
+                    v for k, v in output_dict.items()
+                    if k.endswith("_loss") and isinstance(v, torch.Tensor)
+                )
 
             self.accelerator.backward(total_loss)
 
@@ -375,11 +472,20 @@ class VLATrainer(TrainerUtils):
                 self.accelerator.clip_grad_norm_(self.model.parameters(), self.config.trainer.gradient_clipping)
 
             self.optimizer.step()
-            self.lr_scheduler.step()
+            # NOTE: lr_scheduler.step() is now called from the train loop, gated
+            # by the optimizer-boundary sync flag — calling it every micro-batch
+            # burns through the cosine schedule grad_accum× too fast.
 
-        return {
-            "action_dit_loss": action_loss.item(),
-        }
+        if is_deepspeed:
+            self._ds_micro_step = getattr(self, "_ds_micro_step", 0) + 1
+            grad_accum = max(1, int(self.accelerator.gradient_accumulation_steps))
+            self._last_was_sync_step = (self._ds_micro_step % grad_accum == 0)
+
+        metrics = {"action_dit_loss": action_loss.item()}
+        for k, v in output_dict.items():
+            if k.endswith("_loss") and k != "action_loss" and isinstance(v, torch.Tensor):
+                metrics[k] = v.item()
+        return metrics
 
     def _finalize_training(self):
         """Training end processing."""
@@ -413,6 +519,7 @@ def main(cfg) -> None:
     output_dir = setup_directories(cfg=cfg)
     vla = build_framework(cfg)
     vla_train_dataloader = prepare_data(cfg=cfg, accelerator=accelerator, output_dir=output_dir)
+    _derive_max_steps_from_epochs(cfg, vla_train_dataloader, accelerator)
     optimizer, lr_scheduler = setup_optimizer_and_scheduler(model=vla, cfg=cfg)
 
     trainer = VLATrainer(

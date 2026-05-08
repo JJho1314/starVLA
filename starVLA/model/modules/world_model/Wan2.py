@@ -1,32 +1,27 @@
 # Copyright 2025 starVLA community. All rights reserved.
 # Licensed under the MIT License, Version 1.0 (the "License");
-"""
-Wan2.2-TI2V World Model Interface.
+"""Wan2.2-TI2V World Model Interface (post-C-refactor).
 
-Wraps Wan-AI/Wan2.2-TI2V-5B-Diffusers (diffusion-based Text+Image-to-Video model)
-as a world-model backend for starVLA action prediction frameworks.
+Holds:
+  - tokenizer + text_encoder (UMT5-XXL, frozen) — diffusers
+  - vae (AutoencoderKLWan, frozen) — diffusers
+  - scheduler — diffusers
+  - **transformer** = vendored FastWAM `WanVideoDiT` (replaces diffusers'
+    `WanTransformer3DModel`). The diffusers implementation casts to fp32 5-6× per
+    block in WanTransformerBlock.forward (norm1/norm2/norm3 + residual adds + ff
+    output), inflating activation memory by ~14 GiB at bs=16 across 30 blocks.
+    FastWAM's WanVideoDiT stays in bf16 throughout — same math, much less memory,
+    matches what the FastWAM training/eval pipeline actually uses.
 
-Architecture (diffusers format):
-  - UMT5EncoderModel: text instruction → text embeddings [B, L_text, 4096]
-  - AutoencoderKLWan (VAE): observation image → video latents [B, 48, T, H/16, W/16]
-  - WanTransformer3DModel: 30-layer DiT, hidden_dim=3072 (24 heads × 128 dim)
-    Takes noised latents + text embeddings → denoised latents
-    We extract intermediate hidden states for action-conditioning.
-
-Note: The diffusers version of Wan2.2-TI2V-5B uses WanPipeline (text-only
-conditioning) with expand_timesteps=True for TI2V mode. There is NO CLIP
-image_encoder in this model variant — image conditioning is achieved through
-per-token timestep expansion where the first frame's latent is conditioned
-via timestep=0 (clean).
-
-Key differences from CosmoPredict2:
-  - Text encoder: UMT5 (dim=4096) vs T5 (dim=1024)
-  - VAE latent channels: 48 vs 16
-  - DiT hidden dim: 3072 (24×128) vs 2048 (16×128)
-  - Scheduler: UniPCMultistepScheduler vs FlowMatchEulerDiscreteScheduler
-  - No condition_mask / padding_mask (those are Cosmos-specific)
+Weights are loaded from a Wan2.2-TI2V-5B-Diffusers folder at startup and remapped
+(diffusers key names → FastWAM key names) using `verify_alignment_keymap.pt`.
 """
 
+from __future__ import annotations
+
+import glob
+import logging
+import os
 from typing import Optional
 
 import torch
@@ -34,28 +29,65 @@ import torch.nn as nn
 
 from starVLA.training.trainer_utils import initialize_overwatch
 
+from .wan_video_dit import WanVideoDiT
+
 logger = initialize_overwatch(__name__)
+_keymap_logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Defaults for Wan2.2-TI2V-5B (matches FastWAM `configs/model/fastwam.yaml`).
+# ---------------------------------------------------------------------------
+_WAN22_TI2V_5B_DEFAULT = {
+    "hidden_dim": 3072,
+    "in_dim": 48,
+    "ffn_dim": 14336,
+    "out_dim": 48,
+    "text_dim": 4096,
+    "freq_dim": 256,
+    "eps": 1.0e-6,
+    "patch_size": (1, 2, 2),
+    "num_heads": 24,
+    "attn_head_dim": 128,
+    "num_layers": 30,
+    "has_image_input": False,
+    "seperated_timestep": True,
+    "require_clip_embedding": False,
+    "require_vae_embedding": False,
+    "fuse_vae_embedding_in_latents": True,
+    "video_attention_mask_mode": "first_frame_causal",
+    "action_conditioned": False,
+    "use_gradient_checkpointing": False,
+}
+
+
+class _TransformerConfigShim:
+    """Compat shim: `transformer.config.patch_size` etc. still readable for
+    callers that haven't been refactored to read attributes off the WanVideoDiT
+    instance directly."""
+
+    def __init__(self, cfg: dict):
+        self.patch_size = tuple(cfg.get("patch_size", (1, 2, 2)))
+        self.num_attention_heads = int(cfg.get("num_heads"))
+        self.attention_head_dim = int(cfg.get("attn_head_dim"))
+        self.in_channels = int(cfg.get("in_dim"))
+        self.out_channels = int(cfg.get("out_dim"))
 
 
 class _Wan2_Interface(nn.Module):
-    """
-    World model wrapper for Wan2.2-TI2V-5B-Diffusers.
+    """World-model wrapper for Wan2.2-TI2V-5B.
 
-    The key methods are:
-      - forward(**kwargs) → model outputs with hidden_states
-      - build_inputs(images, instructions) → dict of tensors
-      - generate(**kwargs) → video generation (optional)
-
-    Representation extraction strategy:
-      We run a single DiT forward pass at noise level σ≈0 and register
-      forward hooks to capture intermediate block outputs. These are
-      collected into a [B, N_tokens, hidden_dim] tensor that the action
-      head can consume — analogous to VLM hidden_states.
+    Public API consumed by `WanFastWAM`:
+      - `self.transformer`: `WanVideoDiT` instance (FastWAM-flavour, bf16-clean)
+      - `self.vae`, `self.text_encoder`, `self.tokenizer`, `self.scheduler`,
+        `self.video_processor`: diffusers components, frozen by default
+      - `build_inputs(images, instructions, image_height, image_width)`:
+        encodes inputs → dict with `hidden_states` (VAE latents),
+        `encoder_hidden_states` (text embeds), `timestep` (per-token zeros).
     """
 
     def __init__(self, config: Optional[dict] = None, **kwargs):
         super().__init__()
-
         wm_cfg = config.framework.get("world_model", {})
         model_name = wm_cfg.get(
             "base_wm",
@@ -63,73 +95,165 @@ class _Wan2_Interface(nn.Module):
         )
         self.config = config
 
-        from diffusers import (
-            AutoencoderKLWan,
-            UniPCMultistepScheduler,
-            WanTransformer3DModel,
-        )
+        from diffusers import AutoencoderKLWan, UniPCMultistepScheduler
+        from diffusers.video_processor import VideoProcessor
         from transformers import T5TokenizerFast, UMT5EncoderModel
 
-        logger.info(f"Loading Wan2.2-TI2V from {model_name}")
+        logger.info(f"Loading Wan2.2-TI2V (frozen IO modules) from {model_name}")
 
-        # --- Text encoder: UMT5-XXL ---
-        self.tokenizer = T5TokenizerFast.from_pretrained(
-            model_name, subfolder="tokenizer"
-        )
-        self.text_encoder = UMT5EncoderModel.from_pretrained(
-            model_name, subfolder="text_encoder", torch_dtype=torch.bfloat16
-        )
+        # Tokenizer + text_encoder (frozen).
+        # When `text_embed_cache_path` is set in the world_model config, we load a
+        # pre-computed `{task_string: {"embed", "mask"}}` dict instead of UMT5-XXL.
+        # UMT5-XXL is ~11 GB in bf16 — skipping it on every GPU enables larger
+        # per-device batch sizes (FastWAM does the same via `load_text_encoder: false`).
+        cache_path = wm_cfg.get("text_embed_cache_path", None)
+        self._text_embed_cache: Optional[dict] = None
+        if cache_path:
+            cache_path = str(cache_path)
+            from pathlib import Path as _Path
+            if not _Path(cache_path).exists():
+                raise FileNotFoundError(
+                    f"text_embed_cache_path={cache_path} does not exist. "
+                    f"Run `scripts/precompute_libero_text_embeds.py` first."
+                )
+            logger.info(f"Loading pre-computed text embeds from {cache_path} (skipping UMT5)")
+            payload = torch.load(cache_path, map_location="cpu", weights_only=False)
+            self._text_embed_cache = payload["cache"]
+            self._text_embed_max_length = int(payload.get("max_length", 128))
+            self.tokenizer = None
+            self.text_encoder = None
+        else:
+            self.tokenizer = T5TokenizerFast.from_pretrained(model_name, subfolder="tokenizer")
+            self.text_encoder = UMT5EncoderModel.from_pretrained(
+                model_name, subfolder="text_encoder", torch_dtype=torch.bfloat16
+            )
 
-        # --- DiT transformer ---
-        self.transformer = WanTransformer3DModel.from_pretrained(
-            model_name, subfolder="transformer", torch_dtype=torch.bfloat16
-        )
-
-        # --- VAE (image → latents for DiT input, z_dim=48) ---
+        # VAE (frozen, used for latent encoding/decoding only)
         self.vae = AutoencoderKLWan.from_pretrained(
             model_name, subfolder="vae", torch_dtype=torch.bfloat16
         )
 
-        # --- Scheduler ---
+        # Scheduler (kept around for diffusers-pipeline compat / generate())
         self.scheduler = UniPCMultistepScheduler.from_pretrained(
             model_name, subfolder="scheduler"
         )
 
-        # Use diffusers' VideoProcessor for image/video preprocessing (resize, normalize, etc.)
-        from diffusers.video_processor import VideoProcessor
+        # Image preprocess (PIL → tensor in [-1, 1])
         self.vae_scale_factor_spatial = 2 ** len(self.vae.temperal_downsample)
         self.vae_scale_factor_temporal = 2 ** sum(self.vae.temperal_downsample)
         self.video_processor = VideoProcessor(vae_scale_factor=self.vae_scale_factor_spatial)
 
-        # # Freeze VAE and text encoder by default
-        # self.vae.requires_grad_(False)
-        # self.text_encoder.requires_grad_(False)
-
-        # DiT: 24 heads × 128 dim = 3072
-        self._hidden_size = (
-            self.transformer.config.num_attention_heads
-            * self.transformer.config.attention_head_dim
+        # === Transformer: FastWAM's bf16-clean WanVideoDiT ===
+        video_dit_cfg = self._build_video_dit_config(wm_cfg)
+        logger.info(
+            f"Instantiating WanVideoDiT (FastWAM-flavour) layers={video_dit_cfg['num_layers']} "
+            f"hidden={video_dit_cfg['hidden_dim']} grad_ckpt={video_dit_cfg['use_gradient_checkpointing']}"
         )
+        self.transformer = WanVideoDiT(**video_dit_cfg).to(torch.bfloat16)
 
-        # Config-like shim for framework to read hidden_size
+        if not bool(wm_cfg.get("skip_transformer_load", False)):
+            self._load_transformer_from_diffusers(model_name)
+        else:
+            logger.warning("skip_transformer_load=True; transformer weights are randomly initialized")
+
+        # Compat: callers may still read `transformer.config.patch_size`
+        self.transformer.config = _TransformerConfigShim(video_dit_cfg)
+
+        self._hidden_size = int(video_dit_cfg["num_heads"]) * int(video_dit_cfg["attn_head_dim"])
+
         class _FakeConfig:
             pass
 
         self._model_config = _FakeConfig()
         self._model_config.hidden_size = self._hidden_size
 
-        # Hook storage for intermediate features
-        self._intermediate_features = []
-        self._hooks = []
+    # -----------------------------------------------------------------------
+    # Static helpers
+    # -----------------------------------------------------------------------
+    @staticmethod
+    def _build_video_dit_config(wm_cfg) -> dict:
+        cfg = dict(_WAN22_TI2V_5B_DEFAULT)
+        user = wm_cfg.get("video_dit_config", None)
+        if user:
+            try:
+                from omegaconf import OmegaConf
+                user = OmegaConf.to_container(user, resolve=True) if not isinstance(user, dict) else user
+            except Exception:
+                pass
+            if isinstance(user, dict):
+                cfg.update(user)
+        cfg["patch_size"] = tuple(cfg["patch_size"])
+        return cfg
 
-        extract_layers = wm_cfg.get("extract_layers", [-1])
-        self._extract_layers = extract_layers
-        self._register_hooks()
+    # -----------------------------------------------------------------------
+    # Weight loader: diffusers safetensors → WanVideoDiT keys
+    # -----------------------------------------------------------------------
+    def _load_transformer_from_diffusers(self, model_name: str) -> None:
+        from safetensors.torch import load_file
 
+        # Locate keymap (sits at repo root next to verify_alignment.py)
+        here = os.path.dirname(os.path.abspath(__file__))
+        # walk up: world_model → modules → model → starVLA → repo_root
+        repo_root = os.path.abspath(os.path.join(here, "..", "..", "..", ".."))
+        keymap_path = os.path.join(repo_root, "verify_alignment_keymap.pt")
+        if not os.path.exists(keymap_path):
+            raise FileNotFoundError(
+                f"verify_alignment_keymap.pt not found at {keymap_path}; "
+                f"required to convert diffusers weights → WanVideoDiT format."
+            )
+        km = torch.load(keymap_path, weights_only=False)
+        # km["video"] = {fastwam_key (mot prefix): diffusers_key}
+        # WanVideoDiT keys = fastwam_key without "mixtures.video." prefix
+        diff2wv = {}
+        for fk, dk in km["video"].items():
+            if fk.startswith("mixtures.video."):
+                wv_key = fk[len("mixtures.video."):]
+            else:
+                wv_key = fk
+            diff2wv[dk] = wv_key
+
+        # Locate transformer safetensors shards
+        tx_dir = os.path.join(model_name, "transformer")
+        files = sorted(glob.glob(os.path.join(tx_dir, "*.safetensors")))
+        if not files:
+            raise FileNotFoundError(
+                f"No transformer/*.safetensors under {tx_dir}; cannot load WanVideoDiT."
+            )
+
+        diffusers_state: dict[str, torch.Tensor] = {}
+        for f in files:
+            diffusers_state.update(load_file(f))
+
+        wv_state: dict[str, torch.Tensor] = {}
+        unmapped: list[str] = []
+        for dk, tensor in diffusers_state.items():
+            wv_key = diff2wv.get(dk)
+            if wv_key is None:
+                unmapped.append(dk)
+                continue
+            wv_state[wv_key] = tensor.to(torch.bfloat16)
+
+        # Strict load against the freshly-built WanVideoDiT
+        missing, unexpected = self.transformer.load_state_dict(wv_state, strict=False)
+        if missing or unexpected or unmapped:
+            logger.warning(
+                f"WanVideoDiT load: matched={len(wv_state)} missing={len(missing)} "
+                f"unexpected={len(unexpected)} unmapped_diffusers_keys={len(unmapped)}"
+            )
+            for k in missing[:5]:
+                logger.warning(f"  [missing] {k}")
+            for k in unexpected[:5]:
+                logger.warning(f"  [unexpected] {k}")
+            for k in unmapped[:5]:
+                logger.warning(f"  [unmapped diffusers key] {k}")
+        else:
+            logger.info(f"WanVideoDiT: strict-loaded {len(wv_state)} tensors from {tx_dir} ✓")
+
+    # -----------------------------------------------------------------------
+    # Compat property used by base framework
+    # -----------------------------------------------------------------------
     @property
     def model(self):
-        """Compatibility shim: framework code accesses self.backbone.model.config.hidden_size"""
-
         class _ModelShim:
             pass
 
@@ -137,31 +261,45 @@ class _Wan2_Interface(nn.Module):
         shim.config = self._model_config
         return shim
 
-    def _register_hooks(self):
-        """Register forward hooks on selected transformer blocks."""
-        for hook in self._hooks:
-            hook.remove()
-        self._hooks.clear()
+    # -----------------------------------------------------------------------
+    # Encoders
+    # -----------------------------------------------------------------------
+    def _encode_text(self, instructions, max_length=128):
+        """Encode prompts; returns (embeds [B,L,D] bf16, mask [B,L] bool).
 
-        num_blocks = len(self.transformer.blocks)
-        for layer_idx in self._extract_layers:
-            actual_idx = layer_idx if layer_idx >= 0 else num_blocks + layer_idx
-            if 0 <= actual_idx < num_blocks:
-                block = self.transformer.blocks[actual_idx]
-                hook = block.register_forward_hook(self._capture_hook)
-                self._hooks.append(hook)
+        Two paths:
+          - Cached (preferred): `text_embed_cache_path` was set at init → look up
+            (embed, mask) from precomputed dict, no UMT5 on GPU. Saves ~11 GB.
+          - Online: encode via UMT5 (bf16). Used when no cache provided.
 
-    def _capture_hook(self, module, input, output):
-        """Capture intermediate transformer block output."""
-        if isinstance(output, tuple):
-            self._intermediate_features.append(output[0])
-        else:
-            self._intermediate_features.append(output)
+        ``max_length=128`` matches FastWAM's `context_len: 128`.
+        """
+        if self._text_embed_cache is not None:
+            if max_length != self._text_embed_max_length:
+                raise ValueError(
+                    f"Cached text embeds have max_length={self._text_embed_max_length} "
+                    f"but caller asked for {max_length}. Re-run precompute with the "
+                    f"new max_length or fix the call site."
+                )
+            # Use VAE's device since text encoder is gone.
+            device = next(self.vae.parameters()).device
+            embeds_list, masks_list = [], []
+            for inst in instructions:
+                key = inst.strip()
+                if key not in self._text_embed_cache:
+                    raise KeyError(
+                        f"Instruction not found in text-embed cache: {inst!r}. "
+                        f"Re-run `scripts/precompute_libero_text_embeds.py` to include "
+                        f"this string, or unset `text_embed_cache_path` to fall back to UMT5."
+                    )
+                entry = self._text_embed_cache[key]
+                embeds_list.append(entry["embed"])  # [L, D]
+                masks_list.append(entry["mask"])    # [L]
+            text_embeds = torch.stack(embeds_list, dim=0).to(device=device, dtype=torch.bfloat16)
+            text_mask = torch.stack(masks_list, dim=0).to(device=device, dtype=torch.bool)
+            return text_embeds, text_mask
 
-    def _encode_text(self, instructions, max_length=512):
-        """Encode text instructions using UMT5."""
         device = next(self.text_encoder.parameters()).device
-
         text_inputs = self.tokenizer(
             instructions,
             padding="max_length",
@@ -171,73 +309,47 @@ class _Wan2_Interface(nn.Module):
             return_attention_mask=True,
             return_tensors="pt",
         ).to(device)
-
         with torch.no_grad():
             text_embeds = self.text_encoder(
                 input_ids=text_inputs.input_ids,
                 attention_mask=text_inputs.attention_mask,
-            ).last_hidden_state  # [B, L, 4096]
+            ).last_hidden_state
+        text_mask = text_inputs.attention_mask.to(dtype=torch.bool)
+        return text_embeds.to(dtype=torch.bfloat16), text_mask
 
-        return text_embeds.to(dtype=torch.bfloat16)  # [B, max_length, 4096]
-
-    def _encode_images_vae(self, images, num_frames=None):
-        """Encode observation images through VAE to get latent tokens.
-
-        Two-pass approach (same as CosmoPredict2):
-          Pass 1: preprocess each sample, record real frame counts.
-          Determine target_frames = num_frames if given, else batch max.
-          Pass 2: truncate or pad each sample to target_frames.
-
-        VAE config: z_dim=48, scale_factor_spatial=16, scale_factor_temporal=4
-        T_latent = (target_frames - 1) // 4 + 1
-
-        Args:
-            images: List of List of PIL Images [B, [imgs...]]
-            num_frames: If given, pad/truncate to this exact count.
-                If None (default), pad to the max frame count in the batch.
-
-        Returns:
-            latents: [B, 48, T_latent, H/16, W/16] video latent tensor
-        """
+    def _encode_images_vae(self, images, num_frames=None, image_height=None, image_width=None):
+        """Encode observation images through VAE to latents [B, 48, T_lat, H/16, W/16]."""
         device = next(self.vae.parameters()).device
         dtype = self.vae.dtype
-        height, width = 480, 832
+        height = int(image_height) if image_height is not None else 480
+        width = int(image_width) if image_width is not None else 832
 
-        # Pass 1: preprocess each sample, record real frame counts
-        preprocessed = []
-        frame_counts = []
+        preprocessed, frame_counts = [], []
         for sample_imgs in images:
             if not isinstance(sample_imgs, (list, tuple)):
                 sample_imgs = [sample_imgs]
-
-            video_tensor = self.video_processor.preprocess_video(sample_imgs, height=height, width=width)
-            video_tensor = video_tensor.to(device=device, dtype=dtype)  # [1, C, n_imgs, H, W]
+            video_tensor = self.video_processor.preprocess_video(
+                sample_imgs, height=height, width=width
+            ).to(device=device, dtype=dtype)
             preprocessed.append(video_tensor)
             frame_counts.append(video_tensor.shape[2])
 
-        # Determine target frame count: use num_frames if specified, otherwise batch max
         target_frames = num_frames if num_frames is not None else max(frame_counts)
-
-        # Pass 2: truncate or pad each sample to target_frames
         batch_videos = []
-        for video_tensor in preprocessed:
-            n = video_tensor.shape[2]
+        for v in preprocessed:
+            n = v.shape[2]
             if n > target_frames:
-                video_tensor = video_tensor[:, :, :target_frames]
+                v = v[:, :, :target_frames]
             elif n < target_frames:
-                # Pad with last-frame repetition (matches official Wan pipeline)
-                last_frame = video_tensor[:, :, -1:]
-                padding = last_frame.repeat(1, 1, target_frames - n, 1, 1)
-                video_tensor = torch.cat([video_tensor, padding], dim=2)
-            batch_videos.append(video_tensor.squeeze(0))  # [C, target_frames, H, W]
+                last = v[:, :, -1:]
+                pad = last.repeat(1, 1, target_frames - n, 1, 1)
+                v = torch.cat([v, pad], dim=2)
+            batch_videos.append(v.squeeze(0))
 
-        # Stack to [B, C, target_frames, H, W]
         video = torch.stack(batch_videos, dim=0)
-
         with torch.no_grad():
-            latents = self.vae.encode(video).latent_dist.sample()  # [B, 48, T_latent, H/16, W/16]
+            latents = self.vae.encode(video).latent_dist.sample()
 
-        # Normalize latents (matches official Wan pipeline: (latent - mean) * (1/std))
         latents_mean = (
             torch.tensor(self.vae.config.latents_mean)
             .view(1, self.vae.config.z_dim, 1, 1, 1)
@@ -250,112 +362,48 @@ class _Wan2_Interface(nn.Module):
             .to(latents.device, latents.dtype)
         )
         latents = (latents - latents_mean) * latents_std
-
         return latents
 
-    def build_inputs(self, images, instructions, **kwargs):
-        """Build inputs for the Wan DiT world model.
-
-        Encoding pipeline:
-        1. Text → UMT5 → text embeddings [B, L, 4096]
-        2. Image → VAE → latents [B, 48, T, H', W'] (DiT input)
-
-        Note: No CLIP image conditioning — this diffusers variant uses
-        expand_timesteps mode (per-token timesteps) instead.
-
-        Returns:
-            dict with keys matching forward() expectations
-        """
+    def build_inputs(self, images, instructions, image_height=None, image_width=None, **kwargs):
+        """Encode (images, instructions) → dict consumed by `WanFastWAM` joint training."""
         assert len(images) == len(instructions)
-
-        device = next(self.transformer.parameters()).device
-
-        text_embeds = self._encode_text(instructions)
-        latents = self._encode_images_vae(images)
+        text_embeds, text_mask = self._encode_text(instructions)
+        latents = self._encode_images_vae(images, image_height=image_height, image_width=image_width)
 
         batch_size = latents.shape[0]
         device = latents.device
-
-        # Wan2.2 TI2V uses expand_timesteps: timestep is per-token
-        # Shape: [B, seq_len] where seq_len = T_lat * (H_lat//p_h) * (W_lat//p_w)
-        # For feature extraction at σ≈0, use zeros (clean input)
         p_t, p_h, p_w = self.transformer.config.patch_size
         _, _, T, H, W = latents.shape
         seq_len = (T // p_t) * (H // p_h) * (W // p_w)
-        assert seq_len <= 1024, (
-            f"seq_len={seq_len} exceeds WanTransformer3D rope_max_seq_len=1024. "
-            f"Reduce num_frames or image resolution. "
-            f"(T_lat={T}, H_lat={H}, W_lat={W}, patch={p_t},{p_h},{p_w})"
-        )
         timestep = torch.zeros(batch_size, seq_len, device=device, dtype=torch.long)
 
         return {
             "hidden_states": latents,
             "timestep": timestep,
             "encoder_hidden_states": text_embeds,
+            "encoder_attention_mask": text_mask,
             "_is_wm_input": True,
         }
 
+    # -----------------------------------------------------------------------
+    # forward() is intentionally NOT implemented here.
+    # WanVideoDiT is consumed via `pre_dit`/MoT/`post_dit` rather than a single
+    # monolithic forward call. Callers that need standalone DiT forward should
+    # use `WanVideoDiT.pre_dit + post_dit + per-block` directly.
+    # -----------------------------------------------------------------------
     def forward(self, **kwargs):
-        """Forward pass through the Wan DiT transformer.
-
-        Runs a single-step forward to extract rich spatiotemporal features.
-        Returns an output object with .hidden_states for compatibility.
-        """
-        kwargs.pop("_is_wm_input", False) # pop internal routing flags from kwargs to avoid passing them downstream
-        kwargs.pop("output_hidden_states", False)
-        kwargs.pop("return_dict", True)
-        kwargs.pop("output_attentions", None)
-
-        self._intermediate_features.clear()
-
-        with torch.autocast("cuda", dtype=torch.bfloat16):
-            dit_output = self.transformer(
-                hidden_states=kwargs["hidden_states"],
-                timestep=kwargs["timestep"],
-                encoder_hidden_states=kwargs["encoder_hidden_states"],
-            )
-
-        # Collect features from hooks
-        # WanTransformer3DModel blocks output [B, seq_len, hidden_dim] (already flattened)
-        extracted = []
-        for feat in self._intermediate_features:
-            if feat.dim() == 5:
-                # [B, C, T, H, W] -> [B, T*H*W, C]
-                B, C, T, H, W = feat.shape
-                feat = feat.permute(0, 2, 3, 4, 1).reshape(B, T * H * W, C)
-            extracted.append(feat)
-
-        # Fallback: use transformer output directly
-        if not extracted:
-            out = dit_output.sample if hasattr(dit_output, "sample") else dit_output
-            if isinstance(out, tuple):
-                out = out[0]
-            if out.dim() == 5:
-                B, C, T, H, W = out.shape
-                out = out.permute(0, 2, 3, 4, 1).reshape(B, T * H * W, C)
-            extracted.append(out)
-
-        class _WMOutput:
-            def __init__(self, hidden_states_tuple, loss=None):
-                self.hidden_states = hidden_states_tuple
-                self.loss = loss # TODO if you want to add loss for image reconstruction or other auxiliary objectives, you can include it here and return it in the forward pass
-
-        return _WMOutput(hidden_states_tuple=tuple(extracted))
-
-    def generate(self, **kwargs):
-        """Video generation using the WanPipeline.
-
-        Not used during standard VLA training, but useful for visualization
-        and planning-based approaches.
-        """
-        from diffusers import WanPipeline
-
-        pipe = WanPipeline(
-            tokenizer=self.tokenizer,
-            text_encoder=self.text_encoder,
-            vae=self.vae,
-            transformer=self.transformer,
-            scheduler=self.scheduler,
+        raise NotImplementedError(
+            "Wan2.transformer is FastWAM's WanVideoDiT, which does not expose a monolithic "
+            "forward(). Use the MoT-driven joint flow in WanFastWAM, or call pre_dit + "
+            "post_dit explicitly."
         )
-        return pipe(**kwargs)
+
+    # -----------------------------------------------------------------------
+    # generate() — diffusers-pipeline shortcut, retained for compat (no-op for training)
+    # -----------------------------------------------------------------------
+    def generate(self, **kwargs):
+        raise NotImplementedError(
+            "Standalone WanPipeline.generate() requires diffusers WanTransformer3DModel; "
+            "this checkout uses FastWAM's WanVideoDiT. For video generation, run the "
+            "FastWAM-style sampling flow via MoT.forward."
+        )
