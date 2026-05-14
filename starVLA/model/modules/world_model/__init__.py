@@ -27,6 +27,13 @@ def get_world_model(config):
 
         return _CosmoPredict2_Interface(config)
     elif "wan2" in wm_name.lower() or "ti2v" in wm_name.lower():
+        # New flag `use_fastwam_aligned_io` switches the IO modules
+        # (VAE / T5 / tokenizer / scheduler) to FastWAM's DiffSynth-Studio
+        # vendored implementations — useful when training/eval needs to match
+        # FastWAM-official numerical pipeline exactly.
+        if wm_cfg is not None and bool(wm_cfg.get("use_fastwam_aligned_io", False)):
+            from .Wan2_fastwam import WanVideoBackboneFastWAM
+            return WanVideoBackboneFastWAM(config=config)
         from .Wan2 import _Wan2_Interface
 
         return _Wan2_Interface(config)
