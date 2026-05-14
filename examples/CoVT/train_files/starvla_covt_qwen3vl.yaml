@@ -1,0 +1,82 @@
+run_id: starvla_covt_qwen3vl_demo
+run_root_dir: playground/Checkpoints
+seed: 42
+trackers: [jsonl, wandb]
+wandb_entity: jjho1314
+wandb_project: starVLA_CoVT
+is_debug: false
+
+
+framework:
+  name: QwenCoVT
+  qwenvl:
+    base_vlm: ./playground/Pretrained_models/Qwen3-VL-4B-Instruct
+    attn_implementation: flash_attention_2
+
+  covt:
+    num_sam_tokens: 8
+    sam_embed_dim: 256
+    sam_loss_weight: 1.0
+    # Stage scheduling (in optimization steps).
+    stage_warmup_steps: 0          # >0 means: skip anchor in prompt for first N steps (LM-only)
+    stage_align_steps: 500         # feature-alignment on tokens vs SAM image emb mean
+    stage_full_steps: 50000        # full mask reconstruction loss until this step
+    anchor_cfg:
+      sam:
+        checkpoint: ./playground/Pretrained_models/sam_vit_h_4b8939.pth
+        model_type: vit_h
+        image_size: 256
+
+
+datasets:
+  vlm_data:
+    dataset_py: robointer_covt
+    # ─── RoboInter-Data demo subset ───
+    lmdb_path: /data/LFT-W02_data/junjie/data/InternRobotics/RoboInter-Data/Annotation_demo_larger/demo_annotations
+    video_dir: /data/LFT-W02_data/junjie/data/InternRobotics/RoboInter-Data/Annotation_demo_larger/videos
+    sam_mask_roots:
+      - /data/LFT-W02_data/junjie/data/InternRobotics/RoboInter-Data/segmentation_npz/OXE_DROID/data/ann_human
+      - /data/LFT-W02_data/junjie/data/InternRobotics/RoboInter-Data/segmentation_npz/RH20T/data/ann_human
+    num_sam_tokens: 8
+    image_size: 256
+    include_anchor_in_prompt: true
+    model_max_length: 1024
+    per_device_batch_size: 2
+    num_workers: 4
+
+
+trainer:
+  epochs: 100
+  max_train_steps: 50000
+  num_warmup_steps: 1000
+  save_interval: 5000
+  eval_interval: 100
+  learning_rate:
+    base: 2.5e-05
+    qwen_vl_interface: 1.0e-05
+    sam_projection: 1.0e-04        # heads train at higher LR
+    sam_cross_attn: 1.0e-04
+    sam_query: 1.0e-04
+  lr_scheduler_type: cosine_with_min_lr
+  scheduler_specific_kwargs:
+    min_lr: 1.0e-06
+  freeze_modules: 'anchors'        # freeze the SAM teacher
+  loss_scale:
+    vlm_loss: 1.0
+    seg_loss: 1.0
+  max_grad_norm: 1.0
+  warmup_ratio: 0.1
+  weight_decay: 0.0
+  logging_frequency: 10
+  gradient_clipping: 1.0
+  gradient_accumulation_steps: 4
+
+  optimizer:
+    name: AdamW
+    betas: [0.9, 0.95]
+    eps: 1.0e-08
+    weight_decay: 1.0e-08
+
+  is_resume: false
+  enable_gradient_checkpointing: true
+  enable_mixed_precision_training: true

@@ -1,10 +1,10 @@
 #!/bin/bash
-# === Paths (adapted for this cluster) ===
+# === Paths (LFT-W02 local) ===
 STARVLA_DIR=/data/LFT-W02_data/junjie/VLA_WM/starVLA
 
 cd ${STARVLA_DIR}
 # === Checkpoint ===
-CKPT=${STARVLA_DIR}/playground/Checkpoints/1229_libero4in1_wm4a_cosmopredict2gr00t/checkpoints/steps_80000_pytorch_model.pt
+CKPT=${STARVLA_DIR}/playground/Checkpoints/1229_libero4in1_wm4a_cosmopredict2gr00t/final_model/pytorch_model.pt
 
 ###########################################################################################
 # === Please modify the following paths according to your environment ===
@@ -19,7 +19,7 @@ export MUJOCO_GL=egl
 export PYOPENGL_PLATFORM=egl
 
 host="127.0.0.1"
-base_port=6694
+base_port=${PORT:-6694}
 unnorm_key="franka"
 your_ckpt=${CKPT}
 
@@ -28,11 +28,15 @@ your_ckpt=${CKPT}
 folder_name=$(echo "$your_ckpt" | awk -F'/' '{print $(NF-2)"_"$(NF-1)"_"$NF}')
 # model_root: playground/Checkpoints/<run_id>
 model_root=$(echo "$your_ckpt" | awk -F'/checkpoints/' '{print $1}')
+if [[ "$model_root" == "$your_ckpt" ]]; then
+    # ckpt is in final_model/, not checkpoints/
+    model_root=$(dirname $(dirname "$your_ckpt"))
+fi
 # === End of environment variable configuration ===
 ###########################################################################################
 
-task_suite_name=libero_goal
-num_trials_per_task=50
+task_suite_name=${TASK_SUITE:-libero_goal}
+num_trials_per_task=${NUM_TRIALS:-50}
 video_out_path="${model_root}/results/${task_suite_name}/${folder_name}"
 
 ${LIBERO_Python} ./examples/LIBERO/eval_files/eval_libero.py \

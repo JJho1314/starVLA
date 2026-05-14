@@ -42,6 +42,11 @@ class Args:
     num_steps_wait: int = 10  # Number of steps to wait for objects to stabilize i n sim
     num_trials_per_task: int = 50  # Number of rollouts per task
 
+    # Task slicing for parallel workers (inclusive start, exclusive end). end<0 -> to the end.
+    task_id_start: int = 0
+    task_id_end: int = -1
+    worker_id: int = 0  # for naming the per-worker summary file
+
     #################################################################################################################
     # Utils
     #################################################################################################################
@@ -72,16 +77,20 @@ def eval_libero(args: Args) -> None:
 
     pathlib.Path(args.video_out_path).mkdir(parents=True, exist_ok=True)
 
+    # max_steps aligned with FastWAM upstream (eval_libero_single.py:_get_max_steps).
+    # Previously starVLA used tighter limits matched to demo lengths (220/280/300/520),
+    # but with FastWAM-style replan_steps=5 + ActionEnsembler the policy is more
+    # responsive — give it the same horizon as upstream to allow recovery from drift.
     if args.task_suite_name == "libero_spatial":
-        max_steps = 220  # longest training demo has 193 steps
+        max_steps = 400  # FastWAM upstream: 400 (was starVLA 220)
     elif args.task_suite_name == "libero_object":
-        max_steps = 280  # longest training demo has 254 steps
+        max_steps = 400  # FastWAM upstream: 400 (was starVLA 280)
     elif args.task_suite_name == "libero_goal":
-        max_steps = 300  # longest training demo has 270 steps
+        max_steps = 400  # FastWAM upstream: 400 (was starVLA 300)
     elif args.task_suite_name == "libero_10":
-        max_steps = 520  # longest training demo has 505 steps
+        max_steps = 700  # FastWAM upstream: 700 (was starVLA 520)
     elif args.task_suite_name == "libero_90":
-        max_steps = 400  # longest training demo has 373 steps
+        max_steps = 700  # FastWAM upstream: 700 (was starVLA 400)
     else:
         raise ValueError(f"Unknown task suite: {args.task_suite_name}")
 
@@ -94,7 +103,10 @@ def eval_libero(args: Args) -> None:
 
     # Start evaluation
     total_episodes, total_successes = 0, 0
-    for task_id in tqdm.tqdm(range(num_tasks_in_suite)):
+    per_task_results: dict = {}
+    end = num_tasks_in_suite if args.task_id_end < 0 else min(args.task_id_end, num_tasks_in_suite)
+    start = max(0, args.task_id_start)
+    for task_id in tqdm.tqdm(range(start, end)):
         # Get task
         task = task_suite.get_task(task_id)
 
@@ -161,6 +173,7 @@ def eval_libero(args: Args) -> None:
                 example_dict = {
                     "image": [observation["observation.primary"][0], observation["observation.wrist_image"][0]],
                     "lang": observation["instruction"][0],
+                    "state": observation["observation.state"][0],
                 }
 
                 start_time = time.time()
@@ -190,6 +203,14 @@ def eval_libero(args: Args) -> None:
                     )
                 else:
                     delta_action = np.concatenate([world_vector_delta, rotation_delta, gripper], axis=0)
+
+                # DEBUG: log first 6 raw actions of each task to diagnose
+                if step < 6 and t < args.num_steps_wait + 6:
+                    logging.info(
+                        f"DBG step={step} t={t}: wv=[{world_vector_delta[0]:+.3f},{world_vector_delta[1]:+.3f},{world_vector_delta[2]:+.3f}] "
+                        f"rot=[{rotation_delta[0]:+.3f},{rotation_delta[1]:+.3f},{rotation_delta[2]:+.3f}] "
+                        f"open_gripper={float(open_gripper[0]):+.3f} -> grip={float(gripper[0])}"
+                    )
 
                 full_actions.append(delta_action)
 
@@ -227,9 +248,29 @@ def eval_libero(args: Args) -> None:
         # Log final results
         logging.info(f"Current task success rate: {float(task_successes) / float(task_episodes)}")
         logging.info(f"Current total success rate: {float(total_successes) / float(total_episodes)}")
+        per_task_results[task_id] = {
+            "episodes": task_episodes,
+            "successes": task_successes,
+            "description": task_description,
+        }
 
     logging.info(f"Total success rate: {float(total_successes) / float(total_episodes)}")
     logging.info(f"Total episodes: {total_episodes}")
+
+    summary = {
+        "task_suite_name": args.task_suite_name,
+        "task_id_start": start,
+        "task_id_end": end,
+        "worker_id": args.worker_id,
+        "total_episodes": total_episodes,
+        "total_successes": total_successes,
+        "per_task": per_task_results,
+    }
+    summary_path = pathlib.Path(args.video_out_path) / f"_summary_w{args.worker_id}.json"
+    summary_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(summary_path, "w") as f:
+        json.dump(summary, f, indent=2)
+    logging.info(f"Summary written to {summary_path}")
 
 
 def _get_libero_env(task, resolution, seed):

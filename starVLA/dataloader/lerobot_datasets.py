@@ -86,6 +86,9 @@ def get_vla_dataset(
     for d_name, d_weight, robot_type in filtered_mixture_spec:
         dataset_mixture.append((make_LeRobotSingleDataset(Path(data_root_dir), d_name, robot_type, delete_pause_frame=delete_pause_frame, data_cfg=data_cfg), d_weight))
 
+    balance_dataset_weights = data_cfg.get("balance_dataset_weights", balance_dataset_weights)
+    balance_trajectory_weights = data_cfg.get("balance_trajectory_weights", balance_trajectory_weights)
+
     return LeRobotMixtureDataset(
         dataset_mixture,
         mode=mode,

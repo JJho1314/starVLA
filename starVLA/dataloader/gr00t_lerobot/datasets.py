@@ -218,6 +218,36 @@ def _save_stats_cache(stats_path: Path, cache_config: dict, statistics: dict) ->
     os.replace(tmp_path, stats_path)
 
 
+def _load_fastwam_dataset_stats_override(stats_path: Path | str) -> dict:
+    """Map FastWAM `dataset_stats.json` to the LeRobot column-stat format used here."""
+    path = Path(stats_path)
+    with open(path, "r") as f:
+        payload = json.load(f)
+
+    def _map_block(block: dict) -> dict:
+        return {
+            "min": block["global_min"],
+            "max": block["global_max"],
+            "mean": block["global_mean"],
+            "std": block["global_std"],
+            "q01": block["global_q01"],
+            "q99": block["global_q99"],
+        }
+
+    try:
+        action_stats = payload["action"]["default"]
+        state_stats = payload["state"]["default"]
+    except KeyError as exc:
+        raise KeyError(
+            f"FastWAM stats override must contain action/default and state/default: {path}"
+        ) from exc
+
+    return {
+        "action": _map_block(action_stats),
+        "observation.state": _map_block(state_stats),
+    }
+
+
 def _compute_statistics_for_mode(
     parquet_paths: list[Path],
     dataset_name: str,
@@ -827,7 +857,15 @@ class LeRobotSingleDataset(Dataset):
             pf for pf in parquet_files if "episode_033675.parquet" not in pf.name
         ]
 
-        if is_main():
+        fastwam_stats_path = (
+            self.data_cfg.get("fastwam_dataset_stats_path", None)
+            if self.data_cfg is not None
+            else None
+        )
+
+        if fastwam_stats_path:
+            le_statistics = _load_fastwam_dataset_stats_override(fastwam_stats_path)
+        elif is_main():
             le_statistics = _load_or_compute_statistics(
                 stats_path,
                 stats_cache_config=stats_cache_config,

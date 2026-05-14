@@ -20,6 +20,7 @@ Weights are loaded from a Wan2.2-TI2V-5B-Diffusers folder at startup and remappe
 from __future__ import annotations
 
 import glob
+import hashlib
 import logging
 import os
 from typing import Optional
@@ -108,18 +109,28 @@ class _Wan2_Interface(nn.Module):
         # per-device batch sizes (FastWAM does the same via `load_text_encoder: false`).
         cache_path = wm_cfg.get("text_embed_cache_path", None)
         self._text_embed_cache: Optional[dict] = None
+        self._text_embed_cache_dir: Optional[str] = None
+        self._text_prompt_template = wm_cfg.get("text_prompt_template", None)
+        self._zero_pad_text_embeds = bool(wm_cfg.get("zero_pad_text_embeds", False))
+        self._force_text_mask_ones = bool(wm_cfg.get("force_text_mask_ones", False))
         if cache_path:
             cache_path = str(cache_path)
             from pathlib import Path as _Path
-            if not _Path(cache_path).exists():
+            cache_obj = _Path(cache_path)
+            if not cache_obj.exists():
                 raise FileNotFoundError(
                     f"text_embed_cache_path={cache_path} does not exist. "
                     f"Run `scripts/precompute_libero_text_embeds.py` first."
                 )
-            logger.info(f"Loading pre-computed text embeds from {cache_path} (skipping UMT5)")
-            payload = torch.load(cache_path, map_location="cpu", weights_only=False)
-            self._text_embed_cache = payload["cache"]
-            self._text_embed_max_length = int(payload.get("max_length", 128))
+            if cache_obj.is_dir():
+                logger.info(f"Using FastWAM-style text embed cache dir {cache_path} (skipping UMT5)")
+                self._text_embed_cache_dir = cache_path
+                self._text_embed_max_length = int(wm_cfg.get("text_embed_max_length", 128))
+            else:
+                logger.info(f"Loading pre-computed text embeds from {cache_path} (skipping UMT5)")
+                payload = torch.load(cache_path, map_location="cpu", weights_only=False)
+                self._text_embed_cache = payload["cache"]
+                self._text_embed_max_length = int(payload.get("max_length", 128))
             self.tokenizer = None
             self.text_encoder = None
         else:
@@ -264,6 +275,35 @@ class _Wan2_Interface(nn.Module):
     # -----------------------------------------------------------------------
     # Encoders
     # -----------------------------------------------------------------------
+    def _format_text_instruction(self, instruction: str) -> str:
+        text = str(instruction).strip()
+        template = self._text_prompt_template
+        if template:
+            return str(template).format(task=text)
+        return text
+
+    def _fastwam_align_text_context(self, text_embeds: torch.Tensor, text_mask: torch.Tensor):
+        if self._zero_pad_text_embeds:
+            text_embeds = text_embeds.clone()
+            text_embeds[~text_mask] = 0.0
+        if self._force_text_mask_ones:
+            text_mask = torch.ones_like(text_mask, dtype=torch.bool)
+        return text_embeds, text_mask
+
+    def _load_text_context_from_dir(self, prompt: str, max_length: int):
+        hashed = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+        cache_path = os.path.join(
+            self._text_embed_cache_dir,
+            f"{hashed}.t5_len{max_length}.wan22ti2v5b.pt",
+        )
+        if not os.path.exists(cache_path):
+            raise FileNotFoundError(
+                f"Missing FastWAM text embedding cache: {cache_path}. "
+                f"Prompt was: {prompt!r}"
+            )
+        payload = torch.load(cache_path, map_location="cpu", weights_only=False)
+        return payload["context"], payload["mask"]
+
     def _encode_text(self, instructions, max_length=128):
         """Encode prompts; returns (embeds [B,L,D] bf16, mask [B,L] bool).
 
@@ -274,7 +314,9 @@ class _Wan2_Interface(nn.Module):
 
         ``max_length=128`` matches FastWAM's `context_len: 128`.
         """
-        if self._text_embed_cache is not None:
+        formatted_instructions = [self._format_text_instruction(inst) for inst in instructions]
+
+        if self._text_embed_cache is not None or self._text_embed_cache_dir is not None:
             if max_length != self._text_embed_max_length:
                 raise ValueError(
                     f"Cached text embeds have max_length={self._text_embed_max_length} "
@@ -284,24 +326,27 @@ class _Wan2_Interface(nn.Module):
             # Use VAE's device since text encoder is gone.
             device = next(self.vae.parameters()).device
             embeds_list, masks_list = [], []
-            for inst in instructions:
-                key = inst.strip()
-                if key not in self._text_embed_cache:
-                    raise KeyError(
-                        f"Instruction not found in text-embed cache: {inst!r}. "
-                        f"Re-run `scripts/precompute_libero_text_embeds.py` to include "
-                        f"this string, or unset `text_embed_cache_path` to fall back to UMT5."
-                    )
-                entry = self._text_embed_cache[key]
-                embeds_list.append(entry["embed"])  # [L, D]
-                masks_list.append(entry["mask"])    # [L]
+            for key in formatted_instructions:
+                if self._text_embed_cache_dir is not None:
+                    embed, mask = self._load_text_context_from_dir(key, max_length)
+                else:
+                    if key not in self._text_embed_cache:
+                        raise KeyError(
+                            f"Instruction not found in text-embed cache: {key!r}. "
+                            f"Re-run `scripts/precompute_libero_text_embeds.py` to include "
+                            f"this string, or unset `text_embed_cache_path` to fall back to UMT5."
+                        )
+                    entry = self._text_embed_cache[key]
+                    embed, mask = entry["embed"], entry["mask"]
+                embeds_list.append(embed)  # [L, D]
+                masks_list.append(mask)    # [L]
             text_embeds = torch.stack(embeds_list, dim=0).to(device=device, dtype=torch.bfloat16)
             text_mask = torch.stack(masks_list, dim=0).to(device=device, dtype=torch.bool)
-            return text_embeds, text_mask
+            return self._fastwam_align_text_context(text_embeds, text_mask)
 
         device = next(self.text_encoder.parameters()).device
         text_inputs = self.tokenizer(
-            instructions,
+            formatted_instructions,
             padding="max_length",
             max_length=max_length,
             truncation=True,
@@ -315,7 +360,8 @@ class _Wan2_Interface(nn.Module):
                 attention_mask=text_inputs.attention_mask,
             ).last_hidden_state
         text_mask = text_inputs.attention_mask.to(dtype=torch.bool)
-        return text_embeds.to(dtype=torch.bfloat16), text_mask
+        text_embeds = text_embeds.to(dtype=torch.bfloat16)
+        return self._fastwam_align_text_context(text_embeds, text_mask)
 
     def _encode_images_vae(self, images, num_frames=None, image_height=None, image_width=None):
         """Encode observation images through VAE to latents [B, 48, T_lat, H/16, W/16]."""

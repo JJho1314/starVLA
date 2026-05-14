@@ -38,6 +38,8 @@ def main(args) -> None:
         port=args.port,
         idle_timeout=args.idle_timeout,
         metadata={"env": "simpler_env"},
+        batch_size=args.batch_size,
+        batch_wait_ms=args.batch_wait_ms,
     )
     logging.info("server running ...")
     server.serve_forever()
@@ -49,6 +51,8 @@ def build_argparser():
     parser.add_argument("--port", type=int, default=10093)
     parser.add_argument("--use_bf16", action="store_true")
     parser.add_argument("--idle_timeout", type=int, default=1800, help="Idle timeout in seconds, -1 means never close")
+    parser.add_argument("--batch_size", type=int, default=1, help="Max batched concurrent infer requests; 1 disables batching")
+    parser.add_argument("--batch_wait_ms", type=int, default=20, help="Max ms to wait coalescing more requests into a batch")
     return parser
 
 

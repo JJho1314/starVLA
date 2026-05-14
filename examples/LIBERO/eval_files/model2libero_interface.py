@@ -1,4 +1,4 @@
-from collections import deque
+from collections import defaultdict, deque
 from pathlib import Path
 from typing import Dict, Optional, Sequence
 
@@ -9,6 +9,39 @@ import numpy as np
 from deployment.model_server.tools.websocket_policy_client import WebsocketClientPolicy
 from examples.SimplerEnv.eval_files.adaptive_ensemble import AdaptiveEnsembler
 from starVLA.model.tools import read_mode_config
+
+
+class FastWAMActionEnsembler:
+    """FastWAM-style action ensembler. Each replan adds a chunk indexed by absolute
+    env timestamp; per-step query averages all predictions targeting that ts.
+    Identical to upstream `experiments/libero/action_ensembler.py`.
+    """
+
+    def __init__(self):
+        self.action_cache: dict[int, list[np.ndarray]] = defaultdict(list)
+
+    def reset(self):
+        self.action_cache.clear()
+
+    def add_actions(self, action_chunk: np.ndarray, start_timestamp: int):
+        if action_chunk.ndim == 3:
+            action_chunk = action_chunk.squeeze(0)
+        horizon, action_dim = action_chunk.shape
+        for i in range(horizon):
+            target_ts = start_timestamp + i
+            self.action_cache[target_ts].append(action_chunk[i, :])
+
+    def get_action(self, timestamp: int) -> np.ndarray:
+        if timestamp not in self.action_cache:
+            raise ValueError(f"No actions cached for timestamp {timestamp}")
+        preds = self.action_cache[timestamp]
+        stacked_preds = np.stack(preds, axis=0)
+        return np.mean(stacked_preds, axis=0)
+
+    def cleanup(self, current_timestamp: int):
+        keys_to_delete = [ts for ts in self.action_cache.keys() if ts < current_timestamp]
+        for ts in keys_to_delete:
+            del self.action_cache[ts]
 
 
 class ModelClient:
@@ -57,6 +90,18 @@ class ModelClient:
         self.action_norm_stats = self.get_action_stats(self.unnorm_key, policy_ckpt_path=policy_ckpt_path)
         self.action_chunk_size = self.get_action_chunk_size(policy_ckpt_path=policy_ckpt_path)
 
+        # FastWAM-aligned eval: replan every `replan_steps` env steps (vs old open-loop
+        # 32-step chunk execution) + average overlapping predictions via ActionEnsembler.
+        # Open-loop drift was the dominant SR drop on long-horizon suites (libero_10
+        # was -27% vs paper). FastWAM defaults: replan_steps=5, use_action_ensembler=True.
+        import os as _os
+        self.replan_steps = int(_os.environ.get("REPLAN_STEPS", "5"))
+        self.use_fwam_ensembler = bool(int(_os.environ.get("USE_FWAM_ENSEMBLER", "1")))
+        if self.use_fwam_ensembler:
+            self.fwam_ensembler = FastWAMActionEnsembler()
+        else:
+            self.fwam_ensembler = None
+
     def _add_image_to_history(self, image: np.ndarray) -> None:
         self.image_history.append(image)
         self.num_image_history = min(self.num_image_history + 1, self.horizon)
@@ -66,6 +111,8 @@ class ModelClient:
         self.image_history.clear()
         if self.action_ensemble:
             self.action_ensembler.reset()
+        if self.fwam_ensembler is not None:
+            self.fwam_ensembler.reset()
         self.num_image_history = 0
 
         self.sticky_action_is_on = False
@@ -97,21 +144,41 @@ class ModelClient:
             "num_ddim_steps": self.num_ddim_steps,
         }
 
-        action_chunk_size = self.action_chunk_size
-        if step % action_chunk_size == 0:
+        # FastWAM-aligned: replan every `replan_steps` (default 5) instead of every
+        # `action_chunk_size` (32). Open-loop 32-step execution caused -27% SR drop
+        # on libero_10 vs paper. Each replan pushes the predicted chunk into the
+        # ensembler indexed by absolute env timestamp, and per-step query averages
+        # all predictions targeting that timestamp.
+        if step % self.replan_steps == 0:
             response = self.client.predict_action(vla_input)
             try:
-                normalized_actions = response["data"]["normalized_actions"]  # B, chunk, D
+                normalized_actions = response["data"]["normalized_actions"]  # [B, chunk, D]
             except KeyError:
                 print(f"Response data: {response}")
                 raise KeyError(f"Key 'normalized_actions' not found in response data: {response['data'].keys()}")
 
             normalized_actions = normalized_actions[0]
-            self.raw_actions = self.unnormalize_actions(
+            chunk_raw = self.unnormalize_actions(
                 normalized_actions=normalized_actions, action_norm_stats=self.action_norm_stats
             )
+            if self.fwam_ensembler is not None:
+                self.fwam_ensembler.add_actions(chunk_raw, start_timestamp=step)
+            else:
+                self.raw_actions = chunk_raw
 
-        raw_actions = self.raw_actions[step % action_chunk_size][None]
+        if self.fwam_ensembler is not None:
+            current = self.fwam_ensembler.get_action(step)
+            self.fwam_ensembler.cleanup(step)
+            raw_actions = current[None]
+        else:
+            # FastWAM-style execute-then-replan: each replan_steps cycle, use
+            # the FIRST `replan_steps` actions of the freshly predicted chunk
+            # (discard the rest). Index is `step % replan_steps` not
+            # `step % action_chunk_size` — using the chunk-size modulo here
+            # caused 0% SR in v3-par2 because replan at step=N reset the chunk
+            # but we kept indexing at offset N % 32 instead of 0.
+            offset = step % self.replan_steps
+            raw_actions = self.raw_actions[offset][None]
 
         raw_action = {
             "world_vector": np.array(raw_actions[0, :3]),
@@ -123,16 +190,21 @@ class ModelClient:
 
     @staticmethod
     def unnormalize_actions(normalized_actions: np.ndarray, action_norm_stats: Dict[str, np.ndarray]) -> np.ndarray:
+        """Linear min/max unnorm. Removed the prior `gripper < 0.5 → 0/1` pre-
+        binarize which mishandled normalized [-1, 1] gripper values (threshold
+        0.5 in [-1, 1] space is biased toward close). The downstream
+        `_binarize_gripper_open(v)` in eval_libero.py already binarizes the
+        unnormalized gripper at 0.5 in [0, 1] space, which is the correct
+        midpoint after the linear unnorm.
+        """
         mask = action_norm_stats.get("mask", np.ones_like(action_norm_stats["min"], dtype=bool))
         action_high, action_low = np.array(action_norm_stats["max"]), np.array(action_norm_stats["min"])
         normalized_actions = np.clip(normalized_actions, -1, 1)
-        normalized_actions[:, 6] = np.where(normalized_actions[:, 6] < 0.5, 0, 1)
         actions = np.where(
             mask,
             0.5 * (normalized_actions + 1) * (action_high - action_low) + action_low,
             normalized_actions,
         )
-
         return actions
 
     @staticmethod

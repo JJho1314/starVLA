@@ -45,7 +45,7 @@ export MASTER_PORT=$((29500 + RANDOM % 1000))
 #   WANDB_BASE_URL=https://api.wandb.ai  → public wandb (only works if compute node has external internet)
 export WANDB_MODE="${WANDB_MODE:-online}"
 export WANDB_BASE_URL="${WANDB_BASE_URL:-http://10.12.1.245:8080}"
-export WANDB_API_KEY="${WANDB_API_KEY:-local-37151658708fac20809135dce9e234842db32f97}"
+export WANDB_API_KEY="${WANDB_API_KEY:?WANDB_API_KEY must be set (export it in your env, e.g. ~/.bashrc)}"
 export WANDB_ENTITY="${WANDB_ENTITY:-jjho1314}"
 export WANDB_PROJECT="${WANDB_PROJECT:-starVLA_Libero}"
 

@@ -12,7 +12,9 @@ Two DataConfig variants for the same LIBERO Franka data:
     FastWAM-aligned: 9 video frames at every-4th-step over a 33-step window
     (``num_frames=33, action_video_freq_ratio=4`` in FastWAM's terms),
     32-step action chunk, single proprio frame, and action+state min/max
-    normalization (including ``action.gripper`` and all 8 ``state.*`` dims).
+    normalization. Uses FastWAM's grouped LeRobot metadata:
+    ``state.eef_pose`` (6) + ``state.pad`` (1) + ``state.gripper`` (1) and
+    ``action.eef`` (6) + ``action.gripper`` (1).
     Used only by ``starvla_wanfastwam_libero.yaml``.
 
 Both share the same physical Franka data and (in FastWAM-aligned) the same
@@ -87,7 +89,7 @@ class Libero4in1DataConfig:
 
 # ---------------------------------------------------------------------------
 # FastWAM-aligned config: 9 video frames + 32-step action chunk +
-# proprio loaded + action.gripper / all state.* normalized.
+# proprio loaded + grouped action/state normalization.
 # Drop-in only for WanFastWAM (its `_build_backbone_images` knows how to
 # consume the per-cam-list-of-T-frames format emitted by `_pack_sample`
 # when ``data_cfg.multi_frame_video=true``). DO NOT point other models here.
@@ -98,25 +100,15 @@ class Libero4in1FastWAMDataConfig:
         "video.wrist_image",
     ]
     state_keys = [
-        "state.x",
-        "state.y",
-        "state.z",
-        "state.roll",
-        "state.pitch",
-        "state.yaw",
+        "state.eef_pose",
         "state.pad",
         "state.gripper",
     ]
     action_keys = [
-        "action.x",
-        "action.y",
-        "action.z",
-        "action.roll",
-        "action.pitch",
-        "action.yaw",
+        "action.eef",
         "action.gripper",
     ]
-    language_keys = ["annotation.human.action.task_description"]
+    language_keys = ["annotation.task"]
 
     # 9 video frames at stride 4 over a 33-step window (matches FastWAM's
     # ``num_frames=33, action_video_freq_ratio=4``).
@@ -142,19 +134,9 @@ class Libero4in1FastWAMDataConfig:
             StateActionTransform(
                 apply_to=keys,
                 normalization_modes={
-                    "action.x": "min_max",
-                    "action.y": "min_max",
-                    "action.z": "min_max",
-                    "action.roll": "min_max",
-                    "action.pitch": "min_max",
-                    "action.yaw": "min_max",
+                    "action.eef": "min_max",
                     "action.gripper": "min_max",
-                    "state.x": "min_max",
-                    "state.y": "min_max",
-                    "state.z": "min_max",
-                    "state.roll": "min_max",
-                    "state.pitch": "min_max",
-                    "state.yaw": "min_max",
+                    "state.eef_pose": "min_max",
                     "state.pad": "min_max",
                     "state.gripper": "min_max",
                 },

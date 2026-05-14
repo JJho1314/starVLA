@@ -1,0 +1,89 @@
+run_id: starvla_wm4a_fastwam_mot
+run_root_dir: playground/Checkpoints
+seed: 42
+trackers: [jsonl, wandb]
+wandb_entity: jjho1314
+wandb_project: starVLA_Libero
+is_debug: false
+
+
+framework:
+  name: WanFastWAM_MoT
+  world_model:
+    base_wm: /data/user/jhe724/workspace/weights/TI2V_5B
+    extract_layers: [-1]
+  qwenvl:
+    base_vlm: /data/user/jhe724/workspace/weights/TI2V_5B
+    vl_hidden_dim: 3072
+    num_vl_layers: 30
+  action_dit:
+    action_dim: 1024
+    num_heads: 24
+    attn_head_dim: 128
+    ffn_dim: 4096
+    use_reverse_video: true
+  action_model:
+    action_dim: 7
+    state_dim: 7
+    future_action_window_size: 7
+    past_action_window_size: 0
+  fastwam:
+    lambda_video: 0.1
+    video_max_timestep: 1.0
+    enable_video_loss: true
+    video_loss_dtype: bfloat16
+
+datasets:
+  vla_data:
+    dataset_py: lerobot_datasets
+    data_root_dir: /data/user/jhe724/workspace/data/libero_datasets/libero_lerobot
+    data_mix: libero_all
+    action_type: delta_qpos
+    sequential_step_sampling: False
+    CoT_prompt: "Your task is {instruction}. To identify the key objects for your task. Locate their bounding boxes in [x1,y1,x2,y2] format."
+    CoT_answer: bbox
+    default_image_resolution: [3, 224, 224]
+    per_device_batch_size: 4
+    load_all_data_for_training: true
+    obs: ["image_0"]
+    video_backend: torchvision_av
+
+
+trainer:
+  epochs: 100
+  max_train_steps: 80000
+  num_warmup_steps: 5000
+  save_interval: 10000
+  eval_interval: 100
+  learning_rate:
+    base: 2.5e-05
+    backbone: 1.0e-05
+    action_blocks: 1.0e-04        # MoT-Lite ActionDiT layers
+    reverse_blocks: 1.0e-04
+    action_decoder: 1.0e-04
+    action_query: 1.0e-04
+  lr_scheduler_type: cosine_with_min_lr
+  scheduler_specific_kwargs:
+    min_lr: 1.0e-06
+  freeze_modules: ''
+  loss_scale:
+    vla: 1.0
+  max_grad_norm: 1.0
+  warmup_ratio: 0.1
+  weight_decay: 0.0
+  logging_frequency: 10
+  gradient_clipping: 1.0
+  gradient_accumulation_steps: 4    # 8 GPU × bs=4 × accum=4 = 128 effective
+  gradient_checkpointing: false
+
+  optimizer:
+    name: AdamW
+    betas: [0.9, 0.95]
+    eps: 1.0e-08
+    weight_decay: 1.0e-08
+
+  is_resume: false
+  resume_epoch: null
+  resume_step: null
+  enable_gradient_checkpointing: false
+  enable_mixed_precision_training: true

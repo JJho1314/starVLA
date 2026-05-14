@@ -12,6 +12,10 @@ framework:
   world_model:
     base_wm: /data/user/jhe724/workspace/weights/Wan2.2-TI2V-5B-Diffusers
     extract_layers: [-1]
+    text_embed_cache_path: /data/user/jhe724/workspace/FastWAM/data/text_embeds_cache/libero
+    text_prompt_template: "A video recorded from a robot's point of view executing the following instruction: {task}"
+    zero_pad_text_embeds: true
+    force_text_mask_ones: true
     # use_gradient_checkpointing intentionally NOT enabled on this transformer:
     # MoTAttnProcessor mutates parent._mot_state side-channel; grad-ckpt's backward
     # rerun would read the wrong post-final-layer state and corrupt gradients.
@@ -71,10 +75,15 @@ framework:
 datasets:
   vla_data:
     dataset_py: lerobot_datasets
-    data_root_dir: /data/user/jhe724/workspace/data/libero_fastwam
+    data_root_dir: /data/user/jhe724/workspace/FastWAM/data/libero_mujoco3.3.2
+    fastwam_dataset_stats_path: /data/user/jhe724/workspace/FastWAM/runs/libero_uncond_2cam224_1e-4/2026-05-09_16-19-41/dataset_stats.json
     # FastWAM-aligned mixture: 9 video frames + 32-step action chunk (per
     # `Libero4in1FastWAMDataConfig` registered as robot_type `libero_franka_fastwam`).
     data_mix: libero_all_fastwam
+    # FastWAM trains over the concatenated LeRobot frames. Weighting by dataset
+    # length makes the StarVLA mixture distribution and epoch length match it.
+    balance_dataset_weights: true
+    balance_trajectory_weights: false
     action_type: delta_qpos
     sequential_step_sampling: False
     default_image_resolution: [3, 224, 224]
@@ -101,7 +110,7 @@ trainer:
   # If num_epochs > 0 it overrides max_train_steps.
   num_epochs: null
   max_train_steps: 80000
-  num_warmup_steps: 5000
+  num_warmup_steps: 1085
   save_interval: 10000
   eval_interval: 100
   learning_rate:
@@ -112,7 +121,7 @@ trainer:
   lr_scheduler_type: cosine_with_min_lr
   scheduler_specific_kwargs:
     min_lr: 1.0e-06
-  freeze_modules: backbone.vae,backbone.text_encoder   # FastWAM also keeps VAE+T5 frozen
+  freeze_modules: backbone.vae   # UMT5 is served from precomputed FastWAM text cache, so no text_encoder module exists to freeze.
   loss_scale:
     vla: 1.0
   max_grad_norm: 1.0

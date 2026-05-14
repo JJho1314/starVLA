@@ -45,9 +45,12 @@ def build_dataloader(cfg, dataset_py="lerobot_datasets_oxe"): # TODO now here on
             vla_dataset,
             batch_size=cfg.datasets.vla_data.per_device_batch_size,
             collate_fn=collate_fn,
-            num_workers=4,
+            num_workers=cfg.datasets.vla_data.get("num_workers", 8),
+            persistent_workers=True,
+            prefetch_factor=4,
+            pin_memory=True,
             # shuffle=True
-        )        
+        )
         if dist.get_rank() == 0: 
             
             output_dir = Path(cfg.output_dir)

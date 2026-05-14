@@ -55,6 +55,11 @@ def main():
                     help="UMT5 token sequence length (must match training context_len).")
     ap.add_argument("--device", default="cuda:0")
     ap.add_argument("--out", required=True, help="Output .pt file path.")
+    ap.add_argument("--template", default=None,
+                    help="Prompt wrapper template with `{task}` placeholder (matches "
+                         "config.framework.world_model.text_prompt_template). When set, "
+                         "cache keys = template.format(task=raw_task) AND encoded text "
+                         "= same wrapped string. Without it, cache keys = raw task.")
     args = ap.parse_args()
 
     suites = [s.strip() for s in args.suites.split(",") if s.strip()]
@@ -72,13 +77,17 @@ def main():
         args.wan22_path, subfolder="text_encoder", torch_dtype=torch.bfloat16
     ).to(device).eval()
 
-    # Encode each task, save as dict.
+    # Encode each task, save as dict. When --template is set, the cache key AND
+    # the encoded string both use the wrapped form template.format(task=raw_task)
+    # so eval-time lookup with prompt-wrapped instruction hits.
     cache: dict[str, dict[str, torch.Tensor]] = {}
-    print(f"[3/3] Encoding {len(tasks)} tasks at max_length={args.max_length} ...")
+    print(f"[3/3] Encoding {len(tasks)} tasks at max_length={args.max_length} "
+          f"(template={'<wrapper>' if args.template else 'raw'}) ...")
     with torch.no_grad():
         for task in tasks:
+            text = args.template.format(task=task) if args.template else task
             inputs = tokenizer(
-                [task],
+                [text],
                 padding="max_length",
                 max_length=args.max_length,
                 truncation=True,
@@ -90,12 +99,12 @@ def main():
                 input_ids=inputs.input_ids,
                 attention_mask=inputs.attention_mask,
             ).last_hidden_state
-            cache[task] = {
+            cache[text] = {
                 "embed": embeds[0].to(dtype=torch.bfloat16).cpu(),  # [L, D]
                 "mask": inputs.attention_mask[0].to(dtype=torch.bool).cpu(),  # [L]
             }
             n_real = int(inputs.attention_mask.sum().item())
-            print(f"    {task!r}: {n_real} real tokens")
+            print(f"    {text!r}: {n_real} real tokens")
 
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)

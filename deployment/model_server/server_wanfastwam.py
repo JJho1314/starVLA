@@ -114,10 +114,11 @@ def main(args) -> None:
     if args.dataset_stats:
         import json
         ds = json.load(open(args.dataset_stats))
-        # pick first dataset key under 'libero' (our convention)
-        ds_keys = [k for k in ds.keys() if isinstance(ds[k], dict) and "proprio" in ds[k]]
+        # pick first dataset key under 'libero' (our convention). Newer starVLA
+        # stats use "state"; older stats used "proprio" for the same vector.
+        ds_keys = [k for k in ds.keys() if isinstance(ds[k], dict) and ("proprio" in ds[k] or "state" in ds[k])]
         if ds_keys:
-            pp = ds[ds_keys[0]]["proprio"]
+            pp = ds[ds_keys[0]].get("proprio", ds[ds_keys[0]].get("state"))
             model.set_state_stats(pp["min"], pp["max"])
             logging.info(f"[*] state stats installed (key={ds_keys[0]}, dim={len(pp['min'])})")
         else:
