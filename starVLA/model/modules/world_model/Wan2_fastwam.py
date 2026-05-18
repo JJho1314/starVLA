@@ -309,13 +309,20 @@ class WanVideoBackboneFastWAM(nn.Module):
             "base_wm",
             config.framework.get("qwenvl", {}).get("base_vlm", "Wan-AI/Wan2.2-TI2V-5B-Diffusers"),
         )
-        fastwam_ckpt_root = wm_cfg.get(
-            "fastwam_checkpoints_root",
-            os.environ.get(
-                "STARVLA_FASTWAM_CHECKPOINTS_ROOT",
-                # default points at our local clean clone's checkpoints dir
-                str(_FASTWAM_SRC.parent / "checkpoints"),
-            ),
+        # Resolution priority (highest first):
+        #   1. DIFFSYNTH_MODEL_BASE_PATH (canonical FastWAM env var; survives
+        #      accelerate/deepspeed launchers that strip Python env between bash
+        #      and child processes — set this in the launch sh as belt-and-suspenders).
+        #   2. STARVLA_FASTWAM_CHECKPOINTS_ROOT env var (our own override).
+        #   3. yaml's framework.world_model.fastwam_checkpoints_root.
+        #   4. Fallback to FastWAM repo's checkpoints/ subdir.
+        # Older code consulted yaml FIRST; that fails when CLI overrides don't
+        # propagate through tyro's strict typed configs, leaving stale yaml paths.
+        fastwam_ckpt_root = (
+            os.environ.get("DIFFSYNTH_MODEL_BASE_PATH")
+            or os.environ.get("STARVLA_FASTWAM_CHECKPOINTS_ROOT")
+            or wm_cfg.get("fastwam_checkpoints_root", None)
+            or str(_FASTWAM_SRC.parent / "checkpoints")
         )
         self.config = config
 
@@ -506,7 +513,7 @@ class WanVideoBackboneFastWAM(nn.Module):
         from . import Wan2 as _Wan2
         # The original method is bound; call it as an unbound function with our
         # transformer module as the implicit `self`.
-        _bound = _Wan2.WanVideoBackbone._load_transformer_from_diffusers.__get__(self)
+        _bound = _Wan2._Wan2_Interface._load_transformer_from_diffusers.__get__(self)
         _bound(diffusers_model_dir)
 
     # ----------------------------------------------------------

@@ -90,13 +90,14 @@ class ModelClient:
         self.action_norm_stats = self.get_action_stats(self.unnorm_key, policy_ckpt_path=policy_ckpt_path)
         self.action_chunk_size = self.get_action_chunk_size(policy_ckpt_path=policy_ckpt_path)
 
-        # FastWAM-aligned eval: replan every `replan_steps` env steps (vs old open-loop
-        # 32-step chunk execution) + average overlapping predictions via ActionEnsembler.
-        # Open-loop drift was the dominant SR drop on long-horizon suites (libero_10
-        # was -27% vs paper). FastWAM defaults: replan_steps=5, use_action_ensembler=True.
+        # FastWAM-aligned eval: replan every `replan_steps` env steps and use the
+        # freshly predicted chunk (no overlap averaging). Defaults match upstream
+        # `configs/sim_libero.yaml`: replan_steps=10, use_action_ensembler=false.
+        # Earlier defaults were 5/True, which hurt long-horizon SR (libero_10)
+        # because stale chunks polluted action averages across task transitions.
         import os as _os
-        self.replan_steps = int(_os.environ.get("REPLAN_STEPS", "5"))
-        self.use_fwam_ensembler = bool(int(_os.environ.get("USE_FWAM_ENSEMBLER", "1")))
+        self.replan_steps = int(_os.environ.get("REPLAN_STEPS", "10"))
+        self.use_fwam_ensembler = bool(int(_os.environ.get("USE_FWAM_ENSEMBLER", "0")))
         if self.use_fwam_ensembler:
             self.fwam_ensembler = FastWAMActionEnsembler()
         else:
@@ -225,8 +226,20 @@ class ModelClient:
         return model_config["framework"]["action_model"]["future_action_window_size"] + 1
 
     def _resize_image(self, image: np.ndarray) -> np.ndarray:
-        image = cv.resize(image, tuple(self.image_size), interpolation=cv.INTER_AREA)
-        return image
+        # PIL BILINEAR matches FastWAM training (torchvision.transforms.Resize) and
+        # upstream eval (_center_crop_resize). cv.INTER_AREA produced ~3.8 mean abs
+        # pixel diff vs training distribution → measurable SR drop on libero_10.
+        from PIL import Image as _PILImage
+        pil = _PILImage.fromarray(image)
+        target_w, target_h = int(self.image_size[0]), int(self.image_size[1])
+        src_w, src_h = pil.size
+        scale = max(target_w / src_w, target_h / src_h)
+        resized = pil.resize((round(src_w * scale), round(src_h * scale)), resample=_PILImage.BILINEAR)
+        rw, rh = resized.size
+        left = max((rw - target_w) // 2, 0)
+        top = max((rh - target_h) // 2, 0)
+        cropped = resized.crop((left, top, left + target_w, top + target_h))
+        return np.asarray(cropped, dtype=np.uint8)
 
     def visualize_epoch(
         self, predicted_raw_actions: Sequence[np.ndarray], images: Sequence[np.ndarray], save_path: str

@@ -81,7 +81,10 @@ def main():
 
     # ---- Build framework via the same factory training uses ------------------
     # We do NOT call the full trainer; just instantiate the framework class.
-    sys.path.insert(0, "/data/LFT-W02_data/junjie/VLA_WM/starVLA")
+    # Add the repo root (script lives in starVLA/scripts/) so `starVLA` is importable.
+    _repo_root = str(Path(__file__).resolve().parents[1])
+    if _repo_root not in sys.path:
+        sys.path.insert(0, _repo_root)
     from starVLA.model.framework.WM4A.WanFastWAM import Wan_FastWAM
 
     print(f"\n[smoke] building Wan_FastWAM framework on {args.device} ...")

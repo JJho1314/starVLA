@@ -39,7 +39,7 @@ class Args:
     task_suite_name: str = (
         "libero_goal"  # Task suite. Options: libero_spatial, libero_object, libero_goal, libero_10, libero_90
     )
-    num_steps_wait: int = 10  # Number of steps to wait for objects to stabilize i n sim
+    num_steps_wait: int = 30  # Aligned with FastWAM upstream configs/sim_libero.yaml
     num_trials_per_task: int = 50  # Number of rollouts per task
 
     # Task slicing for parallel workers (inclusive start, exclusive end). end<0 -> to the end.

@@ -766,11 +766,15 @@ class Wan_FastWAM(baseframework):
         text_embeds, text_mask = self._inject_proprio(text_embeds, text_mask, state_t)
         device = text_embeds.device
 
-        # Initialize action latents from N(0, 1)
+        # Initialize action latents from N(0, 1).
+        # FastWAM upstream `infer_action` uses rand_device="cpu", seed=None
+        # → CPU default RNG, varying noise per trial. We match that (drop the
+        # over-correction of manual_seed(42) which had fixed noise across trials
+        # and hurt libero_10 by -1.4pt).
         latents_action = torch.randn(
             (B, self.chunk_len, self.action_dim),
-            device=device, dtype=torch.float32,
-        ).to(dtype=text_embeds.dtype)
+            device="cpu", dtype=torch.float32,
+        ).to(device=device, dtype=text_embeds.dtype)
 
         # === B8: prefill video KV cache once (1 backbone forward) ===
         video_kv_cache, video_seq_len, tokens_per_frame, mot_mask = self._prefill_video_cache(wm_inputs)
