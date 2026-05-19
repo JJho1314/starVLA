@@ -51,13 +51,13 @@ start_server() {
 
 wait_for_server() {
   local port="$1"
-  for i in $(seq 1 1500); do
+  for i in $(seq 1 3600); do
     if (echo > /dev/tcp/${HOST}/${port}) 2>/dev/null; then
       echo "[$(date +%H:%M:%S)] server :${port} READY"; return 0
     fi
     sleep 1
   done
-  echo "[$(date +%H:%M:%S)] server :${port} did NOT come up in 1500s"; return 1
+  echo "[$(date +%H:%M:%S)] server :${port} did NOT come up in 3600s"; return 1
 }
 
 # 1) Boot servers

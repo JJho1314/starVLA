@@ -250,3 +250,97 @@ SUITES="libero_10" bash examples/LIBERO/eval_files/run_eval_fwalign_local.sh   #
 ```bash
 SUITES="libero_10" bash examples/LIBERO/eval_files/run_eval_fwofficial_local.sh
 ```
+
+---
+
+## 后续追加：variance check + v3par3 retest + 失败假设澄清
+
+### Fwalign V8 redo（variance check）
+
+并行用 GPU 1 重跑了一次 fwalign × V8 pipeline（独立 server, port 7694）：
+
+| Suite | main V8 | redo V8 | Δ |
+|---|---|---|---|
+| libero_spatial | 97.8 | 97.60 | -0.2 |
+| libero_object | 99.6 | 99.40 | -0.2 |
+| libero_goal | 96.8 | 94.20 | **-2.6** |
+| libero_10 | 94.0 | 93.80 | -0.2 |
+| **AVG** | **97.05** | **96.25** | **-0.80** |
+
+→ **单次 4-suite eval 的 noise 范围约 ±1 pt**，main 97.05 略偏 lucky。fwalign V8 真实期望应该是 **~96.5 ± 0.8 pt**。
+
+### v3par3 ckpt × V8 pipeline retest（用 stripped ckpt + HF UMT5 cache）
+
+为了让 v3par3 ckpt（含 14.87 GB T5 weights，原始 26 GB）能在本地 A6000 跑：
+1. **strip** ckpt 里所有 `backbone.text_encoder.*` keys → `pytorch_model_no_t5.pt` (13.45 GB, 跟 fwalign 一样大)
+2. **precompute** HF UMT5 cache: `scripts/precompute_libero_text_embeds.py` 跑 40 个 libero task 字符串 → `libero_umt5_hf_embeds_all40.pt` (41 MB)
+3. v3par3 config.yaml 加 `text_embed_cache_path` 指向上面的 cache
+4. server 启动时 Wan2.py 看到 cache → `self.text_encoder = None` → 不 load T5 到 GPU
+
+跑出来：
+
+| Suite | v3par3 × V8 | v3par3 historical (V3-era) | fwalign V8 | Δ vs hist |
+|---|---|---|---|---|
+| libero_spatial | 95.40 | (combined 96.20) | 97.80 | - |
+| libero_object | 98.00 | - | 99.60 | -1.6 |
+| libero_goal | **86.00** ⚠️ | - | 96.80 | **-10.8** |
+| libero_10 | **81.40** ⚠️ | - | 94.00 | **-12.6** |
+| **AVG** | **90.20** ⚠️ | **96.20** | **97.05** | **-6.00** |
+
+**v3par3 × V8 反而比历史 V3-era 低 6 pt**。V8 改动看起来是 fwalign-friendly，对 v3par3 不友好。
+
+### 失败假设澄清：cache 权重不是问题
+
+我**起初猜**「HF UMT5 cache 跟训练时 T5 forward 有 bf16 cast 微差」。验证后**否决**：
+
+```
+v3par3 ckpt 里的 backbone.text_encoder.* (5 个 sample key) vs HF disk Wan2.2-TI2V-5B-Diffusers/text_encoder
+→ 全 bit-equal=True, diff=0.00e+00
+```
+
+→ 我们 cache 用的 T5 跟 v3par3 训练时见的 T5 是**同一份权重**。
+
+### v3par3 × V8 掉 6pt 的真实候选（未单独验证，按可能性排序）
+
+1. **CPU device noise (V8 改的) + Wan2.py 的 HF VAE 路径耦合**：fwalign 用 Wan2_fastwam.py（FastWAM VAE），V8 噪声分布跟它训练时一致；v3par3 用 Wan2.py（HF Diffusers VAE，跟 FastWAM VAE 之前测过 ~0.3% 输出差），V8 的 CPU RNG 噪声 + HF VAE 的微差在 long-horizon (libero_10) 上累积放大
+2. **GPU non-determinism × cache 单次性**：cache 是一次 T5 forward 出来的固定 embeds，训练时模型见过多次 noisy 实现；fwalign 也用 cache 没事，但 v3par3 训练分布可能更敏感
+3. **Mujoco 3.2 → 3.3.2 eval 物理 shift**：v3par3 historical 96.20 是 mujoco 3.2 eval 测的。如果 v3par3 训练数据真是 mujoco 3.2 标定（路径名 `libero_fastwam` 没明示版本），那 V8 用 3.3.2 eval 会对不上
+
+**最干净的验证**：把 v3par3 ckpt 放回 V3-era pipeline（cv.INTER_AREA + CUDA noise + mujoco 3.2）跑一次。回到 ~96.20 = 证实 V8 pipeline 不匹配 v3par3 训练；否则问题在其它处。
+
+### 关键 takeaway
+
+> **V8 五个 fix 是 fwalign training distribution 友好的 alignment**，不是普适的"更好 pipeline"。  
+> 用别的 ckpt（特别是非 fwalign-style 训练的）应当**用它训练时见过的 pipeline 设置**，否则可能离开训练分布、SR 反降。
+
+---
+
+## 复现 97.05 的入口脚本
+
+```bash
+cd /data/LFT-W02_data/junjie/VLA_WM/starVLA
+bash examples/LIBERO/eval_files/run_eval_fwalign_local.sh
+```
+
+调用链：
+
+```
+run_eval_fwalign_local.sh                 # 入口：设 env 路径 + 默认参数
+  └─ exec eval_all_parallel_fwalign.sh    # 2 GPU × 1 server, 5 worker × 4 suite = 20 worker
+       ├─ server: deployment/model_server/server_wanfastwam_starvla.py
+       └─ client: examples/LIBERO/eval_files/eval_libero.py
+                  + model2libero_interface.py
+```
+
+**输入位置（要存在才能跑通）：**
+- 模型 ckpt：`/data/LFT-W02_data/junjie/VLA_WM/fwalign_olabots_ckpts/final_model/pytorch_model.pt` (13 GB)
+- run dir：`/data/LFT-W02_data/junjie/VLA_WM/fwalign_olabots_ckpts/` 含 `config.yaml` + `dataset_statistics.json`
+- libero env 里 mujoco==3.3.2
+
+**输出：**
+- `/data/LFT-W02_data/junjie/VLA_WM/fwalign_olabots_ckpts/results/<suite>/.../w<N>/_summary_w<N>.json`
+- `/data/LFT-W02_data/junjie/VLA_WM/fwalign_olabots_ckpts/results/<suite>/.../_aggregate.json`
+
+**配套控制实验脚本：**
+- `run_eval_fwofficial_local.sh` —— FW-release ckpt × 我们 pipeline
+- `run_eval_starvla_native_local.sh` —— starVLA 原版 Wan2.py 训出来的 ckpt（v3par3-style）走 V8 pipeline
