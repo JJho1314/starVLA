@@ -1,0 +1,168 @@
+run_id: starvla_wanfastwam
+run_root_dir: playground/Checkpoints
+seed: 42
+trackers: [jsonl, wandb]
+wandb_entity: jjho1314
+wandb_project: starVLA_Libero
+is_debug: false
+
+
+framework:
+  name: WanFastWAM
+  world_model:
+    base_wm: /data/LFT-W02_data/junjie/weights/Wan2.2-TI2V-5B-Diffusers
+    extract_layers: [-1]
+    text_embed_cache_path: /data/LFT-W02_data/junjie/weights/fastwam_text_cache_safetensors_libero
+    text_prompt_template: "A video recorded from a robot's point of view executing the following instruction: {task}"
+    zero_pad_text_embeds: true
+    force_text_mask_ones: true
+    # === FastWAM IO alignment (this yaml's purpose) ===
+    # Routes get_world_model() to Wan2_fastwam.WanVideoBackboneFastWAM, which
+    # swaps VAE / T5 / tokenizer / scheduler from HF Diffusers/Transformers
+    # to DiffSynth-Studio's vendored implementations (loaded from .safetensors
+    # via redirect_common_files=true).
+    #
+    # Why: FastWAM-official training/eval uses this stack. starVLA models
+    # trained with HF stack are NOT interchangeable here — T5 cosine sim
+    # between HF UMT5 and DiffSynth WanTextEncoder is only 0.47-0.69 (see
+    # scripts/compare_vae_t5_hf_vs_fastwam.py). For a fresh FastWAM-aligned
+    # training run, use THIS yaml.
+    use_fastwam_aligned_io: true
+    load_text_encoder: false  # local: only have text cache, no tokenizer files
+    # Path to FastWAM checkpoints dir. Must contain:
+    #   DiffSynth-Studio/Wan-Series-Converted-Safetensors/{Wan2.2_VAE,models_t5_umt5-xxl-enc-bf16}.safetensors
+    #   Wan-AI/Wan2.1-T2V-1.3B/google/umt5-xxl/
+    # Override via STARVLA_FASTWAM_CHECKPOINTS_ROOT env var if needed.
+    fastwam_checkpoints_root: /data/LFT-W02_data/junjie/VLA_WM/FastWAM/checkpoints
+    # DO NOT flip to false — Wan-AI .pth path gives 0% SR (see Task #22).
+    redirect_common_files: true
+    # use_gradient_checkpointing intentionally NOT enabled on this transformer:
+    # MoTAttnProcessor mutates parent._mot_state side-channel; grad-ckpt's backward
+    # rerun would read the wrong post-final-layer state and corrupt gradients.
+  qwenvl:
+    base_vlm: /data/LFT-W02_data/junjie/weights/Wan2.2-TI2V-5B-Diffusers
+    vl_hidden_dim: 3072
+    num_vl_layers: 30
+
+  # ActionDiT (FastWAM-aligned, 30-layer DiT, ~1.02B params)
+  action_dit:
+    hidden_dim: 1024
+    action_dim: 7
+    ffn_dim: 4096
+    text_dim: 4096           # must match UMT5-XXL output
+    freq_dim: 256
+    num_heads: 24
+    attn_head_dim: 128
+    num_layers: 30
+    eps: 1.0e-6
+    use_gradient_checkpointing: false  # joint MoT path doesn't go through ActionDiT.forward, so this flag is a no-op here
+    # FastWAM-aligned warm start: ActionDiT initialised from Wan2.2 video DiT via linear-alpha
+    # interpolation (precompute_action_dit_backbone.py output). Skipping this drops ~70% of
+    # FastWAM's reported action-quality head-start.
+    pretrained_path: checkpoints/ActionDiT_linear_interp_Wan22_alphascale_1024hdim.pt
+    skip_pretrained_load: false
+
+  # Action chunking + proprio (FastWAM-aligned: 32-step chunk = 0 past + 1 current + 31 future)
+  action_model:
+    action_dim: 7
+    state_dim: 8             # LIBERO: pos(3) + quat(4) + gripper(1) = 8
+    future_action_window_size: 31   # chunk_len = 32, matches FastWAM (num_frames-1)
+    past_action_window_size: 0
+    num_inference_steps: 10  # FastWAM eval default (configs/train.yaml:25). Was 4 → silent SR mismatch.
+    use_proprio: true        # project state -> 1 token appended to context (aligned with FastWAM)
+
+  # Action FM scheduler (FastWAM uses shift=5.0)
+  action_scheduler:
+    num_train_timesteps: 1000
+    train_shift: 5.0
+    infer_shift: 5.0
+
+  # Video FM scheduler (aligned with FastWAM)
+  video_scheduler:
+    num_train_timesteps: 1000
+    train_shift: 5.0
+    infer_shift: 5.0
+
+  # Loss config (aligned with FastWAMJoint: action attends to FULL video latent)
+  fastwam:
+    lambda_video: 1.0
+    lambda_action: 1.0
+    enable_video_loss: true
+    video_loss_dtype: bfloat16
+    vae_temporal_factor: 4
+    # 'joint' = FastWAMJoint mask (action sees ALL video tokens).
+    # 'fastwam' (default) = FastWAM mask (action sees first-frame video tokens only).
+    mot_attention_mode: joint
+
+
+datasets:
+  vla_data:
+    dataset_py: lerobot_datasets
+    data_root_dir: /data/user/jhe724/workspace/FastWAM/data/libero_mujoco3.3.2
+    fastwam_dataset_stats_path: /data/LFT-W02_data/junjie/VLA_WM/FastWAM/checkpoints/fastwam_release/fastwam/libero_uncond_2cam224_dataset_stats.json
+    # FastWAM-aligned mixture: 9 video frames + 32-step action chunk (per
+    # `Libero4in1FastWAMDataConfig` registered as robot_type `libero_franka_fastwam`).
+    data_mix: libero_all_fastwam
+    # FastWAM trains over the concatenated LeRobot frames. Weighting by dataset
+    # length makes the StarVLA mixture distribution and epoch length match it.
+    balance_dataset_weights: true
+    balance_trajectory_weights: false
+    action_type: delta_qpos
+    sequential_step_sampling: False
+    default_image_resolution: [3, 224, 224]
+    per_device_batch_size: 4
+    load_all_data_for_training: true
+    obs: ["image_0"]
+    video_backend: torchvision_av
+    include_state: true
+    # Tells `_pack_sample` to emit per-cam list of T PIL frames (instead of one
+    # PIL per cam). Required when `observation_indices` has length > 1 — only
+    # WanFastWAM consumes this format. Default `false` keeps all other LIBERO
+    # models (QwenPI / WM4A / cotrain etc) on the legacy single-frame path.
+    multi_frame_video: true
+    # Tells `__getitem__` to derive `action_is_pad` / `image_is_pad` from where
+    # `step_indices` were clipped at episode boundaries. Loss in WanFastWAM uses
+    # these masks to ignore padded frames. Default `false` keeps legacy behavior.
+    emit_is_pad: true
+
+
+trainer:
+  # Choose ONE of:
+  #   num_epochs: 10              # FastWAM-style; derives max_train_steps from dataloader length
+  #   max_train_steps: 80000      # explicit step budget (used if num_epochs is null/0)
+  # If num_epochs > 0 it overrides max_train_steps.
+  num_epochs: null
+  max_train_steps: 80000
+  num_warmup_steps: 1085
+  save_interval: 10000
+  eval_interval: 100
+  learning_rate:
+    base: 1.0e-04
+    backbone: 1.0e-04        # aligned with FastWAM (was 1e-5; 10x slower than FastWAM)
+    action_expert: 1.0e-04
+    proprio_encoder: 1.0e-04
+  lr_scheduler_type: cosine_with_min_lr
+  scheduler_specific_kwargs:
+    min_lr: 1.0e-06
+  freeze_modules: backbone.vae   # UMT5 is served from precomputed FastWAM text cache, so no text_encoder module exists to freeze.
+  loss_scale:
+    vla: 1.0
+  max_grad_norm: 1.0
+  warmup_ratio: 0.1
+  weight_decay: 1.0e-02      # aligned with FastWAM (was 0; FastWAM uses 1e-2)
+  logging_frequency: 10
+  gradient_clipping: 1.0
+  gradient_accumulation_steps: 4    # 4 GPU × bs=4 × accum=4 = 64 effective
+  gradient_checkpointing: false
+
+  optimizer:
+    name: AdamW
+    betas: [0.9, 0.95]
+    eps: 1.0e-08
+    weight_decay: 1.0e-02    # aligned with FastWAM
+
+  is_resume: false
+  resume_epoch: null
+  resume_step: null
+  enable_gradient_checkpointing: false
+  enable_mixed_precision_training: true
