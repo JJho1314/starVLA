@@ -216,6 +216,14 @@ class Wan_FastWAM(baseframework):
         _vd = fw.get("video_loss_dtype", "bfloat16")
         self._video_dtype = torch.bfloat16 if _vd == "bfloat16" else torch.float32
         self._vae_temporal_factor = int(fw.get("vae_temporal_factor", 4))
+        # MoT attention mode: "fastwam" (action sees first-frame video only; matches
+        # FastWAM standard; lets inference reuse video KV cache) or "joint" (action
+        # sees full video; matches FastWAMJoint; can't reuse KV cache at inference).
+        self.mot_attention_mode = str(fw.get("mot_attention_mode", "fastwam"))
+        if self.mot_attention_mode not in ("fastwam", "joint"):
+            raise ValueError(
+                f"fastwam.mot_attention_mode={self.mot_attention_mode!r}; expected 'fastwam' or 'joint'."
+            )
 
         n_action = sum(p.numel() for p in self.action_expert.parameters()) / 1e9
 
@@ -253,6 +261,7 @@ class Wan_FastWAM(baseframework):
         logger.info(
             f"WanFastWAM (post-C): action_expert={n_action:.2f}B, chunk_len={self.chunk_len}, "
             f"infer_steps={self.num_inference_steps}, lambda_video={self.lambda_video}, "
+            f"mot_attention_mode={self.mot_attention_mode!r}, "
             f"MoT installed (FastWAM-style joint attention) on {len(video_blocks)} layers"
         )
 
@@ -443,6 +452,7 @@ class Wan_FastWAM(baseframework):
             action_seq_len=self.chunk_len,
             video_tokens_per_frame=tokens_per_frame,
             video_attention_mask_mode="first_frame_causal",
+            mot_attention_mode=self.mot_attention_mode,
             device=device,
         )
 
@@ -587,6 +597,7 @@ class Wan_FastWAM(baseframework):
             action_seq_len=Sa,
             video_tokens_per_frame=tokens_per_frame,
             video_attention_mask_mode="first_frame_causal",
+            mot_attention_mode=self.mot_attention_mode,
             device=device,
         )
 

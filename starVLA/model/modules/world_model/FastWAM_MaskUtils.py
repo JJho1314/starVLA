@@ -79,10 +79,11 @@ def build_mot_attention_mask(
     video_tokens_per_frame: int,
     video_attention_mask_mode: str = "first_frame_causal",
     device: Union[str, torch.device] = "cpu",
+    mot_attention_mode: str = "fastwam",
 ) -> torch.Tensor:
     """Full joint MoT attention mask. Returns bool tensor [Sv+Sa, Sv+Sa].
 
-    Layout::
+    Layout (mot_attention_mode="fastwam", default, matches `FastWAM._build_mot_attention_mask`)::
 
                           key:  [...video Sv...] [...action Sa...]
                         ┌──────────────────────┬──────────────────────┐
@@ -92,14 +93,29 @@ def build_mot_attention_mask(
                         │  first_frame_tokens  │                      │
                         └──────────────────────┴──────────────────────┘
 
-    The V→A=False region is what makes inference KV-cache reuse safe: video
-    tokens are never updated by action, so the K/V we cache from a single
-    clean video prefill stay valid across all action denoising steps.
+    Layout (mot_attention_mode="joint", matches `FastWAMJoint._build_mot_attention_mask`)::
+
+                        ┌──────────────────────┬──────────────────────┐
+        query video[Sv] │  V→V (mode-driven)   │  V→A: all False      │
+                        ├──────────────────────┼──────────────────────┤
+        query action[Sa]│  A→V: ALL True       │  A→A: all True       │
+                        └──────────────────────┴──────────────────────┘
+
+    The V→A=False region is what makes inference KV-cache reuse safe in
+    "fastwam" mode: video tokens are never updated by action, so the K/V we
+    cache from a single clean video prefill stay valid across all action
+    denoising steps. In "joint" mode, action sees the full evolving video
+    latent, so KV-cache reuse is NOT safe — inference must re-encode video
+    each denoise step (see ``FastWAMJoint.infer_action`` upstream).
     """
     if video_seq_len <= 0:
         raise ValueError(f"`video_seq_len` must be positive, got {video_seq_len}")
     if action_seq_len <= 0:
         raise ValueError(f"`action_seq_len` must be positive, got {action_seq_len}")
+    if mot_attention_mode not in ("fastwam", "joint"):
+        raise ValueError(
+            f"Unsupported mot_attention_mode={mot_attention_mode!r}. Expected 'fastwam' or 'joint'."
+        )
 
     total_seq_len = video_seq_len + action_seq_len
     mask = torch.zeros((total_seq_len, total_seq_len), dtype=torch.bool, device=device)
@@ -113,9 +129,14 @@ def build_mot_attention_mask(
     )
     # A → A
     mask[video_seq_len:, video_seq_len:] = True
-    # A → V (first frame only)
-    first_frame_tokens = min(video_tokens_per_frame, video_seq_len)
-    mask[video_seq_len:, :first_frame_tokens] = True
+    # A → V
+    if mot_attention_mode == "joint":
+        # FastWAMJoint: action sees ALL video tokens (full video latent).
+        mask[video_seq_len:, :video_seq_len] = True
+    else:
+        # FastWAM default: action sees only first-frame video tokens.
+        first_frame_tokens = min(video_tokens_per_frame, video_seq_len)
+        mask[video_seq_len:, :first_frame_tokens] = True
     # V → A stays all False from the zeros init.
 
     return mask
