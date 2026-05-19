@@ -812,3 +812,191 @@ class Wan_FastWAM(baseframework):
                 latents_action = self.action_scheduler_infer.step(v_pred, step_dt, latents_action)
 
         return {"normalized_actions": latents_action.detach().cpu().float().numpy()}
+
+    # ============================================================================
+    # FastWAMJoint-faithful inference (separate from the standard `predict_action`
+    # path; only invoke for ckpts trained with `mot_attention_mode: joint`).
+    # ============================================================================
+
+    def _predict_joint_noise(
+        self,
+        latents_video: torch.Tensor,     # [B, z_dim, T_lat, H_lat, W_lat]
+        latents_action: torch.Tensor,    # [B, chunk_len, action_dim]
+        timestep_video: torch.Tensor,    # [B]
+        timestep_action: torch.Tensor,   # [B]
+        context: torch.Tensor,            # [B, L, text_dim] (already proprio-injected)
+        context_mask: torch.Tensor,       # [B, L] bool
+    ) -> tuple:
+        """One joint MoT forward (no KV cache reuse).
+
+        Mirrors upstream `FastWAMJoint._predict_joint_noise`. Returns
+        (v_pred_video, v_pred_action) — flow-matching velocity predictions for
+        both modalities, ready to be fed into the respective schedulers' `step`.
+        """
+        video_seq_len, tokens_per_frame = self._compute_video_geom(latents_video)
+        Sa = latents_action.shape[1]
+        device = latents_video.device
+
+        video_pre = self.backbone.transformer.pre_dit(
+            x=latents_video,
+            timestep=timestep_video,
+            context=context,
+            context_mask=context_mask,
+            fuse_vae_embedding_in_latents=True,
+        )
+        action_pre = self.action_expert.pre_dit(
+            action_tokens=latents_action,
+            timestep=timestep_action,
+            context=context,
+            context_mask=context_mask,
+        )
+        mot_mask = build_mot_attention_mask(
+            video_seq_len=video_seq_len,
+            action_seq_len=Sa,
+            video_tokens_per_frame=tokens_per_frame,
+            video_attention_mask_mode="first_frame_causal",
+            mot_attention_mode=self.mot_attention_mode,
+            device=device,
+        )
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            mot_out = self.mot.forward(
+                embeds_all={"video": video_pre["tokens"], "action": action_pre["tokens"]},
+                attention_mask=mot_mask,
+                freqs_all={"video": video_pre["freqs"], "action": action_pre["freqs"]},
+                context_all={
+                    "video": {"context": video_pre["context"], "mask": video_pre["context_mask"]},
+                    "action": {"context": action_pre["context"], "mask": action_pre["context_mask"]},
+                },
+                t_mod_all={"video": video_pre["t_mod"], "action": action_pre["t_mod"]},
+            )
+            v_pred_video = self.backbone.transformer.post_dit(mot_out["video"], video_pre)
+            v_pred_action = self.action_expert.head(mot_out["action"])
+        return v_pred_video, v_pred_action
+
+    @torch.inference_mode()
+    def predict_action_joint(self, examples: List[dict], **kwargs) -> dict:
+        """FastWAMJoint-faithful inference: per-step joint denoise of video+action.
+
+        Mirrors `FastWAMJoint.infer_action` upstream
+        (`fastwam/models/wan22/fastwam_joint.py:96`):
+          - Initialize BOTH `latents_video` and `latents_action` from N(0,1)
+            on CPU (unseeded, matches FastWAM upstream rand_device="cpu", seed=None).
+          - Replace `latents_video[:,:,0:1]` with the encoded clean first-frame
+            latent (TI2V conditioning).
+          - At each of `num_inference_steps` steps: run ONE joint MoT forward
+            (no KV cache reuse), step both schedulers, re-pin the first frame.
+          - Return the final action chunk.
+
+        Cost: O(num_inference_steps × full MoT forward) — strictly worse than the
+        prefill+cache fast path (`predict_action`). Only use this when the ckpt
+        was trained with `mot_attention_mode: joint` AND you specifically want to
+        match upstream FastWAMJoint inference numerically.
+
+        Required config (read from `framework.fastwam`):
+          - `num_video_frames` (default 9): number of pixel-space video frames
+            used during training. Determines temporal latent length via
+            `latent_t = (num_video_frames - 1) // vae_temporal_factor + 1`.
+        """
+        import logging as _logging
+        if self.mot_attention_mode != "joint":
+            _logging.warning(
+                "[predict_action_joint] mot_attention_mode=%r (expected 'joint'). "
+                "Running with full A→V mask anyway; ckpt was likely NOT trained for this "
+                "and SR will degrade.",
+                self.mot_attention_mode,
+            )
+
+        if type(examples) is not list:
+            examples = [examples]
+        raw_images = [example["image"] for example in examples]
+        batch_images = self._build_backbone_images(raw_images)
+        instructions = [example["lang"] for example in examples]
+
+        wm_inputs = self.backbone.build_inputs(
+            images=batch_images,
+            instructions=instructions,
+            image_height=self.image_height,
+            image_width=self.image_width,
+        )
+        text_embeds = wm_inputs["encoder_hidden_states"]
+        text_mask = wm_inputs.get("encoder_attention_mask", None)
+        B = len(examples)
+        device = text_embeds.device
+        dtype = text_embeds.dtype
+
+        # State / proprio (same as predict_action).
+        state_raw = []
+        for ex in examples:
+            s = ex.get("state", None)
+            if s is None:
+                s = ex.get("observation.state", None)
+            state_raw.append(s)
+        state_raw = [s for s in state_raw if s is not None]
+        state_t = (
+            torch.tensor(np.array(state_raw), device=device, dtype=torch.float32)
+            if len(state_raw) == B
+            else None
+        )
+        if state_t is not None and state_t.dim() == 3:
+            state_t = state_t.squeeze(1)
+        if state_t is not None:
+            state_t = self._normalize_state(state_t)
+        text_embeds, text_mask = self._inject_proprio(text_embeds, text_mask, state_t)
+
+        # First-frame VAE latent (already encoded by build_inputs; shape [B, z_dim, 1, H_lat, W_lat]).
+        first_frame_latents = wm_inputs["hidden_states"]
+        if first_frame_latents.shape[2] != 1:
+            # build_inputs is called with single-frame images, so temporal dim should be 1.
+            # If a future config feeds multi-frame, we still only treat frame 0 as the clean anchor.
+            first_frame_latents = first_frame_latents[:, :, 0:1].contiguous()
+        _, z_dim, _, H_lat, W_lat = first_frame_latents.shape
+
+        # Temporal latent length, derived from num_video_frames + vae_temporal_factor.
+        fw_cfg = self.config.framework.get("fastwam", {})
+        num_video_frames = int(fw_cfg.get("num_video_frames", 9))
+        if (num_video_frames - 1) % self._vae_temporal_factor != 0:
+            raise ValueError(
+                f"num_video_frames-1 ({num_video_frames - 1}) must be divisible by "
+                f"vae_temporal_factor ({self._vae_temporal_factor}) for VAE-aligned latent_t."
+            )
+        latent_t = (num_video_frames - 1) // self._vae_temporal_factor + 1
+        if latent_t < 1:
+            raise ValueError(f"latent_t derived as {latent_t} from num_video_frames={num_video_frames}")
+
+        # CPU unseeded RNG matches FastWAM upstream `infer_action(seed=None, rand_device='cpu')`.
+        latents_video = torch.randn(
+            (B, z_dim, latent_t, H_lat, W_lat),
+            device="cpu", dtype=torch.float32,
+        ).to(device=device, dtype=dtype)
+        latents_action = torch.randn(
+            (B, self.chunk_len, self.action_dim),
+            device="cpu", dtype=torch.float32,
+        ).to(device=device, dtype=dtype)
+        # Pin first frame to clean latent (TI2V anchor).
+        latents_video[:, :, 0:1] = first_frame_latents.to(device=device, dtype=dtype)
+
+        ts_v, deltas_v = self.video_scheduler_infer.build_inference_schedule(
+            num_inference_steps=self.num_inference_steps,
+            device=device, dtype=latents_video.dtype,
+        )
+        ts_a, deltas_a = self.action_scheduler_infer.build_inference_schedule(
+            num_inference_steps=self.num_inference_steps,
+            device=device, dtype=latents_action.dtype,
+        )
+        for step_t_v, step_dt_v, step_t_a, step_dt_a in zip(ts_v, deltas_v, ts_a, deltas_a):
+            t_in_v = step_t_v.unsqueeze(0).expand(B).contiguous().to(latents_video.dtype)
+            t_in_a = step_t_a.unsqueeze(0).expand(B).contiguous().to(latents_action.dtype)
+            v_pred_video, v_pred_action = self._predict_joint_noise(
+                latents_video=latents_video,
+                latents_action=latents_action,
+                timestep_video=t_in_v,
+                timestep_action=t_in_a,
+                context=text_embeds,
+                context_mask=text_mask,
+            )
+            latents_video = self.video_scheduler_infer.step(v_pred_video, step_dt_v, latents_video)
+            latents_action = self.action_scheduler_infer.step(v_pred_action, step_dt_a, latents_action)
+            # Re-pin first frame (it never gets denoised; matches upstream).
+            latents_video[:, :, 0:1] = first_frame_latents.to(device=device, dtype=latents_video.dtype)
+
+        return {"normalized_actions": latents_action.detach().cpu().float().numpy()}
