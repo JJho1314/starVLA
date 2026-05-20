@@ -66,14 +66,85 @@ def setup_directories(cfg) -> Path:
     return output_dir
 
 
-def prepare_data(cfg, accelerator, output_dir) -> DataLoader:
-    """Prepare VLA training data."""
-    logger.info(f"Creating VLA Dataset with Mixture `{cfg.datasets.vla_data.data_mix}`")
-    vla_train_dataloader = build_dataloader(cfg=cfg, dataset_py=cfg.datasets.vla_data.dataset_py)
+def prepare_data(cfg, accelerator, output_dir):
+    """Prepare VLA training and (optional) validation dataloaders.
 
+    Returns:
+        (train_dataloader, val_dataloader_or_None)
+
+    Validation split is opt-in via either of:
+        cfg.datasets.vla_data.val_fraction    (float in (0, 1))
+        cfg.datasets.vla_data.val_num_samples (int)
+
+    If neither is set, ``val_dataloader_or_None`` is ``None`` and behavior
+    is identical to before this change.
+    """
+    logger.info(f"Creating VLA Dataset with Mixture `{cfg.datasets.vla_data.data_mix}`")
+    full_train_dataloader = build_dataloader(cfg=cfg, dataset_py=cfg.datasets.vla_data.dataset_py)
     accelerator.dataloader_config.dispatch_batches = False
+
+    train_dl, val_dl = _maybe_split_val_loader(full_train_dataloader, cfg)
+
     dist.barrier()
-    return vla_train_dataloader
+    return train_dl, val_dl
+
+
+def _maybe_split_val_loader(full_loader, cfg):
+    """Hold out a deterministic Subset for validation.
+
+    Picks the held-out indices via a numpy permutation seeded with
+    ``cfg.seed`` so train/val sets are reproducible across runs.
+
+    Returns the original loader unchanged (and ``None``) when no
+    validation budget is configured.
+    """
+    val_frac_raw = getattr(cfg.datasets.vla_data, "val_fraction", 0.0)
+    val_n_raw = getattr(cfg.datasets.vla_data, "val_num_samples", 0)
+    val_frac = float(val_frac_raw or 0.0)
+    val_n = int(val_n_raw or 0)
+    if val_frac <= 0 and val_n <= 0:
+        return full_loader, None
+
+    from torch.utils.data import DataLoader, Subset
+
+    ds = full_loader.dataset
+    n = len(ds)
+    if val_n <= 0:
+        val_n = max(1, int(n * val_frac))
+    # Cap: never let val eat more than 25% of data.
+    val_n = min(val_n, max(1, n // 4))
+
+    seed = int(getattr(cfg, "seed", 42))
+    rng = np.random.default_rng(seed)
+    perm = rng.permutation(n)
+    val_idx = perm[:val_n].tolist()
+    train_idx = perm[val_n:].tolist()
+
+    def _rebuild(subset, shuffle):
+        nw = full_loader.num_workers
+        kw = dict(
+            batch_size=full_loader.batch_size,
+            collate_fn=full_loader.collate_fn,
+            num_workers=nw,
+            pin_memory=full_loader.pin_memory,
+            shuffle=shuffle,
+            drop_last=True,
+        )
+        # `persistent_workers` / `prefetch_factor` are only valid when num_workers>0.
+        if nw > 0:
+            kw["persistent_workers"] = getattr(full_loader, "persistent_workers", False)
+            pf = getattr(full_loader, "prefetch_factor", None)
+            if pf is not None:
+                kw["prefetch_factor"] = pf
+        return DataLoader(subset, **kw)
+
+    train_dl = _rebuild(Subset(ds, train_idx), shuffle=True)
+    val_dl = _rebuild(Subset(ds, val_idx), shuffle=False)
+    logger.info(
+        f"VLA val split: held out {len(val_idx)} / {n} samples "
+        f"({len(val_idx) / n * 100:.2f}%); seed={seed}."
+    )
+    return train_dl, val_dl
 
 
 def _derive_max_steps_from_epochs(cfg, vla_train_dataloader, accelerator) -> None:
@@ -134,10 +205,20 @@ def setup_optimizer_and_scheduler(model, cfg) -> Tuple[torch.optim.Optimizer, to
 
 
 class VLATrainer(TrainerUtils):
-    def __init__(self, cfg, model, vla_train_dataloader, optimizer, lr_scheduler, accelerator):
+    def __init__(
+        self,
+        cfg,
+        model,
+        vla_train_dataloader,
+        optimizer,
+        lr_scheduler,
+        accelerator,
+        vla_val_dataloader=None,
+    ):
         self.config = cfg
         self.model = model
         self.vla_train_dataloader = vla_train_dataloader
+        self.vla_val_dataloader = vla_val_dataloader
         self.optimizer = optimizer
         self.lr_scheduler = lr_scheduler
         self.accelerator = accelerator
@@ -166,12 +247,26 @@ class VLATrainer(TrainerUtils):
         self.model = self.freeze_backbones(self.model, freeze_modules=freeze_modules)
         self.print_trainable_parameters(self.model)
 
-        self.model, self.optimizer, self.vla_train_dataloader = self.setup_distributed_training(
-            self.accelerator,
-            self.model,
-            self.optimizer,
-            self.vla_train_dataloader,
-        )
+        if self.vla_val_dataloader is not None:
+            (
+                self.model,
+                self.optimizer,
+                self.vla_train_dataloader,
+                self.vla_val_dataloader,
+            ) = self.setup_distributed_training(
+                self.accelerator,
+                self.model,
+                self.optimizer,
+                self.vla_train_dataloader,
+                self.vla_val_dataloader,
+            )
+        else:
+            self.model, self.optimizer, self.vla_train_dataloader = self.setup_distributed_training(
+                self.accelerator,
+                self.model,
+                self.optimizer,
+                self.vla_train_dataloader,
+            )
 
         self._init_wandb()
 
@@ -366,6 +461,15 @@ class VLATrainer(TrainerUtils):
                 if self.completed_steps % self.config.trainer.eval_interval == 0:
                     step_metrics = self.eval_action_model(step_metrics)
 
+                # Optional validation pass on the held-out split.
+                val_interval = int(getattr(self.config.trainer, "val_interval", 0) or 0)
+                if (
+                    val_interval > 0
+                    and self.vla_val_dataloader is not None
+                    and self.completed_steps % val_interval == 0
+                ):
+                    step_metrics.update(self._eval_on_validation())
+
                 step_metrics["data_time"] = t_end_data - t_start_data
                 step_metrics["model_time"] = t_end_model - t_start_model
                 self._log_metrics(step_metrics)
@@ -377,6 +481,75 @@ class VLATrainer(TrainerUtils):
                     break
 
         self._finalize_training()
+
+    def _eval_on_validation(self) -> dict:
+        """Run model.forward over a few validation batches and return averaged
+        per-loss metrics with the ``val/`` wandb prefix.
+
+        Activated when ``trainer.val_interval > 0`` and a validation
+        dataloader was built in :func:`prepare_data`. Costs one extra
+        forward per ``val_num_batches`` batches per ``val_interval`` steps —
+        no backward, no optimizer step.
+        """
+        if self.vla_val_dataloader is None:
+            return {}
+
+        num_batches = int(getattr(self.config.trainer, "val_num_batches", 8) or 8)
+        was_training = self.model.training
+        self.model.eval()
+
+        sums_cpu: dict[str, float] = {}    # CPU floats, easier to gather_object
+        n_batches_seen = 0
+
+        val_iter = iter(self.vla_val_dataloader)
+        with torch.no_grad():
+            for _ in range(num_batches):
+                try:
+                    batch = next(val_iter)
+                except StopIteration:
+                    val_iter = iter(self.vla_val_dataloader)
+                    try:
+                        batch = next(val_iter)
+                    except StopIteration:
+                        break
+
+                with torch.autocast("cuda", dtype=torch.bfloat16):
+                    out = self.accelerator.unwrap_model(self.model).forward(batch)
+
+                for k, v in out.items():
+                    if not (k.endswith("_loss") and isinstance(v, torch.Tensor)):
+                        continue
+                    sums_cpu[k] = sums_cpu.get(k, 0.0) + float(v.detach().float().item())
+                n_batches_seen += 1
+
+        if was_training:
+            self.model.train()
+
+        # Collect per-rank (sums, count) at rank 0 — gather_object handles ranks
+        # that saw different loss key sets without deadlocking on collective ops.
+        all_sums = self.accelerator.gather_for_metrics([sums_cpu], use_gather_object=True)
+        all_counts = self.accelerator.gather_for_metrics(
+            [int(n_batches_seen)], use_gather_object=True
+        )
+
+        if not self.accelerator.is_main_process:
+            return {}
+
+        total_count = int(sum(all_counts))
+        if total_count == 0:
+            return {}
+
+        merged: dict[str, float] = {}
+        for rank_sums in all_sums:
+            for k, v in rank_sums.items():
+                merged[k] = merged.get(k, 0.0) + float(v)
+
+        out_metrics: dict[str, float] = {
+            f"val/{k}": v / total_count for k, v in merged.items()
+        }
+        if out_metrics:
+            out_metrics["val/total_loss"] = float(sum(out_metrics.values()))
+        return out_metrics
 
     def eval_action_model(self, step_metrics: dict = None) -> float:
         """Run simple action-eval on current batch and attach score to metrics."""
@@ -518,7 +691,9 @@ def main(cfg) -> None:
 
     output_dir = setup_directories(cfg=cfg)
     vla = build_framework(cfg)
-    vla_train_dataloader = prepare_data(cfg=cfg, accelerator=accelerator, output_dir=output_dir)
+    vla_train_dataloader, vla_val_dataloader = prepare_data(
+        cfg=cfg, accelerator=accelerator, output_dir=output_dir
+    )
     _derive_max_steps_from_epochs(cfg, vla_train_dataloader, accelerator)
     optimizer, lr_scheduler = setup_optimizer_and_scheduler(model=vla, cfg=cfg)
 
@@ -526,6 +701,7 @@ def main(cfg) -> None:
         cfg=cfg,
         model=vla,
         vla_train_dataloader=vla_train_dataloader,
+        vla_val_dataloader=vla_val_dataloader,
         optimizer=optimizer,
         lr_scheduler=lr_scheduler,
         accelerator=accelerator,

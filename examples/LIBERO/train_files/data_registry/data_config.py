@@ -191,4 +191,13 @@ DATASET_NAMED_MIXTURES = {
         ("libero_spatial_no_noops_lerobot", 1.0, "libero_franka_fastwam"),
         ("libero_10_no_noops_lerobot", 1.0, "libero_franka_fastwam"),
     ],
+    # Same as ``libero_all_fastwam`` but with the ``_1.0.0_`` folder suffix
+    # used by the LFT-W02 local LIBERO_LeRobot release (data layout that ships
+    # via huggingface ``physical-intelligence/libero`` etc).
+    "libero_all_fastwam_local": [
+        ("libero_object_no_noops_1.0.0_lerobot", 1.0, "libero_franka_fastwam"),
+        ("libero_goal_no_noops_1.0.0_lerobot", 1.0, "libero_franka_fastwam"),
+        ("libero_spatial_no_noops_1.0.0_lerobot", 1.0, "libero_franka_fastwam"),
+        ("libero_10_no_noops_1.0.0_lerobot", 1.0, "libero_franka_fastwam"),
+    ],
 }

@@ -1,0 +1,136 @@
+# Local-paths variant of starvla_wan_metaquery_fastwam_libero.yaml
+# Hardware target: 2× A6000-48G on LFT-W02 (vs canonical 8× H100-80G).
+run_id: starvla_wan_metaquery_fastwam_local
+run_root_dir: playground/Checkpoints
+seed: 42
+trackers: [jsonl, wandb]
+wandb_entity: jjho1314
+wandb_project: starVLA_Libero
+is_debug: false
+
+
+framework:
+  name: WanMetaQueryFastWAM
+
+  # ─── Wan2.2-TI2V-5B (local weights) ──────────────────────────────────────
+  world_model:
+    base_wm: /data/LFT-W02_data/junjie/weights/Wan2.2-TI2V-5B-Diffusers
+    extract_layers: [-1]
+    text_embed_cache_path: /data/LFT-W02_data/junjie/weights/fastwam_text_cache_safetensors_libero
+    text_prompt_template: "A video recorded from a robot's point of view executing the following instruction: {task}"
+    zero_pad_text_embeds: true
+    force_text_mask_ones: true
+
+  qwenvl:
+    base_vlm: /data/LFT-W02_data/junjie/weights/Wan2.2-TI2V-5B-Diffusers
+    vl_hidden_dim: 3072
+    num_vl_layers: 30
+
+  action_dit:
+    hidden_dim: 1024
+    action_dim: 7
+    ffn_dim: 4096
+    text_dim: 4096
+    freq_dim: 256
+    num_heads: 24
+    attn_head_dim: 128
+    num_layers: 30
+    eps: 1.0e-6
+    use_gradient_checkpointing: true     # A6000-48G → enable to fit
+    pretrained_path: checkpoints/ActionDiT_linear_interp_Wan22_alphascale_1024hdim.pt
+    skip_pretrained_load: false
+
+  action_model:
+    action_dim: 7
+    state_dim: 8
+    future_action_window_size: 31
+    past_action_window_size: 0
+    num_inference_steps: 10
+    use_proprio: true
+
+  action_scheduler: {num_train_timesteps: 1000, train_shift: 5.0, infer_shift: 5.0}
+  video_scheduler:  {num_train_timesteps: 1000, train_shift: 5.0, infer_shift: 5.0}
+
+  fastwam:
+    lambda_video: 1.0
+    lambda_action: 1.0
+    enable_video_loss: true
+    video_loss_dtype: bfloat16
+    vae_temporal_factor: 4
+
+  # ─── VLM-side context (MetaQuery Plan B) ─────────────────────────────────
+  vlm:
+    base_vlm: /data/LFT-W02_data/junjie/weights/Qwen3-VL-4B-Instruct
+    attn_implementation: sdpa            # flash_attn broken on this machine
+    num_queries: 64
+    trainable: false                     # MetaQuery-style: freeze MLLM
+    connector_num_layers: 8              # ~870M (MetaQuery uses 24 → ~2.5B)
+    connector_num_heads: 40              # 2560 / 64
+    connector_num_kv_heads: 40
+    connector_ffn_mult: 4
+    connector_rope_theta: 1000000.0
+    rms_init: 1.0
+
+
+datasets:
+  vla_data:
+    dataset_py: lerobot_datasets
+    data_root_dir: /data/LFT-W02_data/junfeng/data/LIBERO_LeRobot
+    fastwam_dataset_stats_path: /data/LFT-W02_data/junjie/VLA_WM/FastWAM/checkpoints/fastwam_release/fastwam/libero_uncond_2cam224_dataset_stats.json
+    # Same as `libero_all_fastwam` but expects `_1.0.0_lerobot` folder names
+    # (matches LFT-W02 local LIBERO_LeRobot release).
+    data_mix: libero_all_fastwam_local
+    balance_dataset_weights: true
+    balance_trajectory_weights: false
+    action_type: delta_qpos
+    sequential_step_sampling: False
+    default_image_resolution: [3, 224, 224]
+    per_device_batch_size: 1             # A6000-48G with full pipeline → bs=1
+    load_all_data_for_training: true
+    obs: ["image_0"]
+    video_backend: torchvision_av
+    include_state: true
+    multi_frame_video: true
+    emit_is_pad: true
+    val_fraction: 0.02
+    val_num_samples: 0
+
+
+trainer:
+  num_epochs: null
+  max_train_steps: 80000
+  num_warmup_steps: 1085
+  save_interval: 5000
+  eval_interval: 200
+  val_interval: 500
+  val_num_batches: 4               # smaller — only 1 GPU
+  learning_rate:
+    base: 1.0e-04
+    backbone: 1.0e-04
+    action_expert: 1.0e-04
+    proprio_encoder: 1.0e-04
+    connector: 5.0e-04
+    vlm: 0.0
+  lr_scheduler_type: cosine_with_min_lr
+  scheduler_specific_kwargs:
+    min_lr: 1.0e-06
+  freeze_modules: 'backbone.vae,vlm'
+  loss_scale:
+    vla: 1.0
+  max_grad_norm: 1.0
+  warmup_ratio: 0.1
+  weight_decay: 1.0e-02
+  logging_frequency: 10
+  gradient_clipping: 1.0
+  gradient_accumulation_steps: 32        # 2 GPU × bs=1 × accum=32 = 64 effective
+  gradient_checkpointing: true           # critical for A6000-48G
+
+  optimizer:
+    name: AdamW
+    betas: [0.9, 0.95]
+    eps: 1.0e-08
+    weight_decay: 1.0e-02
+
+  is_resume: false
+  enable_gradient_checkpointing: true
+  enable_mixed_precision_training: true
