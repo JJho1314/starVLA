@@ -27,12 +27,11 @@
 #   Wall-clock estimate: ~16–22 h on 8× H100 (+VLM forward overhead).
 #   SLURM cap: 36 h.
 #
-# IO path: FastWAM-aligned (DiffSynth VAE + T5, NOT diffusers).
-#   - use_fastwam_aligned_io=true   (CLI)
-#   - fastwam_checkpoints_root      (CLI)
-#   - redirect_common_files=true    (CLI)
-#   - STARVLA_FASTWAM_REPO_PATH     (env, needed at import)
-#   - STARVLA_FASTWAM_CHECKPOINTS_ROOT (env, needed at import)
+# IO path: diffusers (Wan2.py / _Wan2_Interface) — the v3par3 path verified
+# at 97.05 SR. We do NOT enable use_fastwam_aligned_io because Wan2_fastwam.py
+# in this branch references a non-existent class (Wan2.WanVideoBackbone — see
+# line 509). When that's fixed upstream we can switch to the fastwam-aligned
+# IO for strictest fwalign_joint baseline parity.
 #
 # MoT attention: `joint` mode (action sees full video latent during training).
 # Ckpts trained this way must be evaluated with predict_action_joint.
@@ -133,7 +132,9 @@ FASTWAM_STATS="${FASTWAM_STATS:-${default_fastwam_stats}}"
 ACCELERATE_BIN="${ACCELERATE_BIN:-/data/user/jhe724/.conda/envs/starVLA/bin/accelerate}"
 DS_CONFIG="${DS_CONFIG:-starVLA/config/deepseeds/deepspeed_zero2_fastwam.yaml}"
 
-# Wan2_fastwam needs these at import time
+# Wan2_fastwam needs these at import time. Currently NOT used (we're on the
+# diffusers Wan2.py path) but harmless to set in case use_fastwam_aligned_io
+# is re-enabled later.
 export STARVLA_FASTWAM_REPO_PATH="${STARVLA_FASTWAM_REPO_PATH:-${default_fastwam_repo}}"
 export STARVLA_FASTWAM_CHECKPOINTS_ROOT="${STARVLA_FASTWAM_CHECKPOINTS_ROOT:-${default_fastwam_ckpts}}"
 
@@ -154,6 +155,7 @@ NUM_VIDEO_FRAMES="${NUM_VIDEO_FRAMES:-9}"
 VAL_FRACTION="${VAL_FRACTION:-0.02}"
 VAL_INTERVAL="${VAL_INTERVAL:-500}"
 VAL_NUM_BATCHES="${VAL_NUM_BATCHES:-8}"
+VAL_NUM_MSE_BATCHES="${VAL_NUM_MSE_BATCHES:-2}"   # 0 disables val/mse_score
 
 # ---------------------------------------------------------------------------
 # Pre-flight sanity checks (matches fwalign_joint preflight set)
@@ -164,8 +166,7 @@ err=0
 [[ -d "${LIBERO_DATA}" ]]                               || { echo "✗ Missing LIBERO_DATA: ${LIBERO_DATA}" >&2; err=1; }
 [[ -e "${TEXT_EMBED_CACHE}" ]]                          || { echo "✗ Missing TEXT_EMBED_CACHE: ${TEXT_EMBED_CACHE}" >&2; err=1; }
 [[ -f "${FASTWAM_STATS}" ]]                             || { echo "✗ Missing FASTWAM_STATS: ${FASTWAM_STATS}" >&2; err=1; }
-[[ -d "${STARVLA_FASTWAM_REPO_PATH}/src/fastwam" ]]     || { echo "✗ Missing ${STARVLA_FASTWAM_REPO_PATH}/src/fastwam (clone FastWAM and set STARVLA_FASTWAM_REPO_PATH)" >&2; err=1; }
-[[ -d "${STARVLA_FASTWAM_CHECKPOINTS_ROOT}/DiffSynth-Studio" ]] || { echo "✗ Missing ${STARVLA_FASTWAM_CHECKPOINTS_ROOT}/DiffSynth-Studio (download Wan2.2_VAE + UMT5)" >&2; err=1; }
+# (FastWAM-aligned IO checks omitted — we're on the diffusers path.)
 [[ -x "${ACCELERATE_BIN}" ]]                            || { echo "✗ Missing ACCELERATE_BIN: ${ACCELERATE_BIN}" >&2; err=1; }
 [[ -f "${DS_CONFIG}" ]]                                 || { echo "✗ Missing DS_CONFIG: ${DS_CONFIG}" >&2; err=1; }
 (( err == 0 )) || { echo "Pre-flight failed."; exit 1; }
@@ -236,9 +237,6 @@ fi
     --framework.world_model.text_embed_cache_path "${TEXT_EMBED_CACHE}" \
     --framework.world_model.zero_pad_text_embeds true \
     --framework.world_model.force_text_mask_ones true \
-    --framework.world_model.use_fastwam_aligned_io true \
-    --framework.world_model.fastwam_checkpoints_root "${STARVLA_FASTWAM_CHECKPOINTS_ROOT}" \
-    --framework.world_model.redirect_common_files true \
     --framework.action_dit.skip_pretrained_load false \
     --framework.fastwam.lambda_video 1.0 \
     --framework.fastwam.lambda_action 1.0 \
@@ -256,11 +254,12 @@ fi
     --trainer.max_train_steps "${MAX_STEPS}" \
     --trainer.num_warmup_steps "${WARMUP_STEPS}" \
     --trainer.gradient_accumulation_steps "${GRAD_ACCUM}" \
-    --trainer.freeze_modules 'backbone.vae,vlm' \
+    --trainer.freeze_modules 'backbone.vae' \
     --trainer.save_interval 5000 \
     --trainer.eval_interval 200 \
     --trainer.val_interval "${VAL_INTERVAL}" \
     --trainer.val_num_batches "${VAL_NUM_BATCHES}" \
+    --trainer.val_num_mse_batches "${VAL_NUM_MSE_BATCHES}" \
     --trainer.logging_frequency 50 \
     --trainer.enable_mixed_precision_training true \
     --run_root_dir "${run_root_dir}" \
