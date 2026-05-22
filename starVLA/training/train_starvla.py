@@ -201,6 +201,19 @@ def setup_optimizer_and_scheduler(model, cfg) -> Tuple[torch.optim.Optimizer, to
             param_groups = [g for g in param_groups if g["params"]]
             param_groups.extend(extra_groups)
 
+    # Drop groups where every param has requires_grad=False. DeepSpeed ZeRO-2's
+    # partitioner calls torch._C._nn.flatten_dense_tensors on each group's
+    # gradient list and raises `RuntimeError: torch.cat(): expected a non-empty
+    # list of Tensors` when the group has zero trainable params. Native PyTorch
+    # AdamW would silently skip them, but DS gives no such grace.
+    # This bites WanMetaQueryFastWAM after extra_optimizer_groups() carves the
+    # embed/lm_head out of `base`: what's left in `base` is the frozen Qwen3-VL
+    # transformer body (~4B params, all requires_grad=False).
+    param_groups = [
+        g for g in param_groups
+        if any(p.requires_grad for p in g["params"])
+    ]
+
     optimizer = torch.optim.AdamW(
         param_groups,
         lr=cfg.trainer.learning_rate.base,
