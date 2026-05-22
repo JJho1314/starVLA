@@ -116,12 +116,23 @@ trainer:
     action_expert: 1.0e-04
     proprio_encoder: 1.0e-04
     connector: 5.0e-04             # higher LR for randomly-initialised connector
-    vlm: 0.0                       # frozen
+    # NOTE: do NOT add `vlm: 0.0` here. build_param_lr_groups walks `model.vlm`
+    # whole-module; with lr=0 the new BOI/EOI/<|imgK|> embedding rows end up
+    # in a lr=0 group and never train (the row-mask hook makes grads flow,
+    # but optimizer step = lr × Adam_update = 0). Verified bit-exact unchanged
+    # at step 20000 of run 20260521_231811. Letting the VLM fall into the
+    # `base` group is safe: the frozen transformer body has requires_grad=False
+    # so the optimizer's `if p.grad is None: continue` skips it entirely; only
+    # the new embed/lm_head rows actually train.
   lr_scheduler_type: cosine_with_min_lr
   scheduler_specific_kwargs:
     min_lr: 1.0e-06
-  # Freeze: Wan VAE + entire VLM. Connector / video DiT / ActionDiT / proprio_encoder train.
-  freeze_modules: 'backbone.vae,vlm'
+  # Only freeze VAE here. Do NOT add 'vlm' — framework.__init__ already sets
+  # requires_grad=False on the entire VLM and re-enables only the new
+  # embed/lm_head rows via a row-mask hook. Adding 'vlm' to freeze_modules
+  # would re-run freeze_backbones() AFTER __init__ and re-freeze those rows
+  # (silently killing the row-mask hook). See commit 08a2ddd.
+  freeze_modules: 'backbone.vae'
   loss_scale:
     vla: 1.0
   max_grad_norm: 1.0

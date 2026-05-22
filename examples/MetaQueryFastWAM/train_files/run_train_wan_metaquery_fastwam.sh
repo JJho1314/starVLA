@@ -12,7 +12,10 @@ export MASTER_PORT=$((29500 + RANDOM % 1000))
 # Reuses the existing VLA training entry (train_starvla.py): the framework's
 # forward/predict_action are inherited from Wan_FastWAM untouched.
 Framework_name=WanMetaQueryFastWAM
-freeze_module_list='backbone.vae,vlm'
+# Only freeze VAE. The VLM is frozen inside framework.__init__ (with row-mask
+# hook keeping the new embed/lm_head rows trainable). Including 'vlm' here
+# would re-freeze those rows after __init__. See commit 08a2ddd.
+freeze_module_list='backbone.vae'
 base_wm=/data/user/jhe724/workspace/weights/Wan2.2-TI2V-5B-Diffusers
 base_vlm=./playground/Pretrained_models/Qwen3-VL-4B-Instruct
 config_yaml=./examples/MetaQueryFastWAM/train_files/starvla_wan_metaquery_fastwam_libero.yaml

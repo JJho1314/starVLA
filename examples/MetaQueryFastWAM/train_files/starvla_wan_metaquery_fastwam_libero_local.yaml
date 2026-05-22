@@ -110,11 +110,15 @@ trainer:
     action_expert: 1.0e-04
     proprio_encoder: 1.0e-04
     connector: 5.0e-04
-    vlm: 0.0
+    # NOTE: do NOT add `vlm: 0.0` — see canonical yaml's note. Setting it
+    # would route the new embed/lm_head rows to a lr=0 group and silently
+    # disable their training despite the row-mask hook.
   lr_scheduler_type: cosine_with_min_lr
   scheduler_specific_kwargs:
     min_lr: 1.0e-06
-  freeze_modules: 'backbone.vae,vlm'
+  # Only freeze VAE — see canonical yaml's note. Adding 'vlm' would re-freeze
+  # the new embed/lm_head rows after framework.__init__ unfreezes them.
+  freeze_modules: 'backbone.vae'
   loss_scale:
     vla: 1.0
   max_grad_norm: 1.0
