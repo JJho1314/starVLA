@@ -181,6 +181,26 @@ def _derive_max_steps_from_epochs(cfg, vla_train_dataloader, accelerator) -> Non
 def setup_optimizer_and_scheduler(model, cfg) -> Tuple[torch.optim.Optimizer, torch.optim.lr_scheduler._LRScheduler]:
     """Set optimizer and scheduler."""
     param_groups = build_param_lr_groups(model=model, cfg=cfg)
+
+    # Framework hook: pull selected params into their own group with overridden
+    # `weight_decay` / `lr`. Used by WanMetaQueryFastWAM to carve VLM embed /
+    # lm_head out into a wd=0 group — the row-mask hook zeros gradients on the
+    # 151669 frozen rows, but AdamW decoupled weight_decay still applies
+    # `param *= (1 - lr*wd)` every step (~3% uniform shrink over 30k steps for
+    # lr=1e-4, wd=1e-2). wd=0 freezes the old rows exactly.
+    unwrapped = model.module if hasattr(model, "module") else model
+    extra_fn = getattr(unwrapped, "extra_optimizer_groups", None)
+    if callable(extra_fn):
+        extra_groups = extra_fn()
+        if extra_groups:
+            extra_ids = set()
+            for g in extra_groups:
+                extra_ids.update(id(p) for p in g["params"])
+            for g in param_groups:
+                g["params"] = [p for p in g["params"] if id(p) not in extra_ids]
+            param_groups = [g for g in param_groups if g["params"]]
+            param_groups.extend(extra_groups)
+
     optimizer = torch.optim.AdamW(
         param_groups,
         lr=cfg.trainer.learning_rate.base,
@@ -191,7 +211,11 @@ def setup_optimizer_and_scheduler(model, cfg) -> Tuple[torch.optim.Optimizer, to
 
     if dist.is_initialized() and dist.get_rank() == 0:
         for group in optimizer.param_groups:
-            logger.info(f"LR Group {group['name']}: lr={group['lr']}, num_params={len(group['params'])}")
+            wd = group.get("weight_decay", cfg.trainer.optimizer.weight_decay)
+            logger.info(
+                f"LR Group {group['name']}: lr={group['lr']}, "
+                f"wd={wd}, num_params={len(group['params'])}"
+            )
 
     lr_scheduler = get_scheduler(
         name=cfg.trainer.lr_scheduler_type,

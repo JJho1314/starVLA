@@ -233,6 +233,54 @@ class WanMetaQueryFastWAM(Wan_FastWAM):
             lm_head.weight.register_hook(_hook)
 
     # ------------------------------------------------------------------ #
+    # Optimizer integration: pull VLM embed/lm_head out into a wd=0 group
+    # ------------------------------------------------------------------ #
+    def extra_optimizer_groups(self) -> List[dict]:
+        """Carve the VLM embed_tokens.weight and lm_head.weight tensors into a
+        dedicated ``weight_decay=0`` param group.
+
+        Rationale: ``_register_vlm_new_token_grad_mask`` installs a row-mask hook
+        that zeros gradients on the 151669 pre-existing rows so the optimizer's
+        grad-driven update is exactly 0 for them. But AdamW's *decoupled* weight
+        decay path runs unconditionally — ``param *= (1 - lr × wd)`` — which
+        would shrink every row, frozen or not, by ~3% over a 30k-step run at
+        lr=1e-4, wd=1e-2. The shrink is uniform across all 151669 old rows so
+        Qwen3's RMSNorm after the embed lookup largely absorbs it; lm_head's
+        shrink is irrelevant because we read ``out.hidden_states[-1]`` and never
+        consume the lm_head logits. But it still introduces a slow drift in the
+        relative scale of the 66 trainable new rows vs the 151669 frozen old
+        rows that this codebase relies on the row-mask hook to preserve, and
+        the safest thing to do is just turn the decay off for both tensors.
+
+        We DO NOT split per-row (wd=0 only on frozen rows): PyTorch optimizer
+        groups operate at tensor granularity. New rows also get wd=0 here,
+        which removes a small amount of regularization on the 66 trainable
+        rows; acceptable trade because Adam's update magnitude on these rows
+        is dominated by the actual gradient signal, not by the wd term.
+
+        Used by ``setup_optimizer_and_scheduler`` in ``train_starvla.py``.
+        """
+        embed_w = self.vlm.get_input_embeddings().weight
+        lm_head_module = self.vlm.get_output_embeddings()
+        lm_head_w = lm_head_module.weight if lm_head_module is not None else None
+
+        base_lr = float(self.config.trainer.learning_rate.base)
+        groups = [{
+            "params": [embed_w],
+            "lr": base_lr,
+            "weight_decay": 0.0,
+            "name": "vlm.embed_tokens_no_decay",
+        }]
+        if lm_head_w is not None and lm_head_w is not embed_w:
+            groups.append({
+                "params": [lm_head_w],
+                "lr": base_lr,
+                "weight_decay": 0.0,
+                "name": "vlm.lm_head_no_decay",
+            })
+        return groups
+
+    # ------------------------------------------------------------------ #
     # build_inputs wrapping
     # ------------------------------------------------------------------ #
     def _wrap_backbone_build_inputs(self) -> None:
