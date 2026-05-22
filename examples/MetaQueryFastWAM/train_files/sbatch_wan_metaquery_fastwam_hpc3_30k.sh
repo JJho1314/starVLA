@@ -148,7 +148,7 @@ VIDEO_BACKEND="${VIDEO_BACKEND:-torchvision_av}"
 VLM_ATTN="${VLM_ATTN:-flash_attention_2}"
 # MoT attention mode — `joint` matches fwalign_joint baseline (action sees
 # full video latent during training). Eval must use predict_action_joint.
-MOT_MODE="${MOT_MODE:-joint}"
+MOT_MODE="${MOT_MODE:-fastwam}"
 NUM_VIDEO_FRAMES="${NUM_VIDEO_FRAMES:-9}"
 
 # Validation knobs (0 to disable val)
