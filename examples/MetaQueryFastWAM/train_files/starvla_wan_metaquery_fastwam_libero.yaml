@@ -68,7 +68,8 @@ framework:
     # fully trainable in our setup (MetaQuery freezes diffusion).
     # → expected connector size ~840M (vs ~2.54B at depth=24).
     # If you want strict MetaQuery-XL alignment, set connector_num_layers: 24.
-    connector_num_layers: 8              # MetaQuery uses 24; 8 = Q-Former / Resampler scale
+    connector_num_layers: 24             # MetaQuery-XL depth; VLM is sole cond so give connector full capacity
+    vlm_only_conditioning: true          # VLM queries REPLACE T5 as sole cross-attn cond (MetaQuery-faithful)
     connector_num_heads: 40              # 2560 / 64 = 40 (for Qwen3-VL-4B)
     connector_num_kv_heads: 40           # no GQA, matches MetaQuery
     connector_ffn_mult: 4                # intermediate = hidden * 4

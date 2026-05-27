@@ -6,12 +6,11 @@ export NCCL_TIMEOUT=10000
 export NCCL_SOCKET_TIMEOUT_MS=360000
 export MASTER_PORT=$((29500 + RANDOM % 1000))
 ###########################################################################################
-# WanFastWAM (B5 transitional, FastWAM-aligned ActionDiT + flow-matching + proprio).
-# joint MoT attention + KV cache reuse will be wired in B7 / B8.
-Framework_name=WanFastWAM
+# WanFastWAM_MoT: Wan2.2-TI2V backbone + ActionDiT (MoT-Lite) + video FM aux loss.
+Framework_name=WanFastWAM_MoT
 freeze_module_list=''
 base_wm=/data/user/jhe724/workspace/weights/TI2V_5B
-config_yaml=./examples/LIBERO/train_files/starvla_wanfastwam_libero.yaml
+config_yaml=./examples/LIBERO/train_files/starvla_wm4a_libero_fastwam_mot.yaml
 libero_data_root=/data/user/jhe724/workspace/data/libero_datasets/libero_lerobot
 data_mix=libero_all
 run_root_dir=./playground/Checkpoints

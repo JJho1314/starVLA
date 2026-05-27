@@ -1,0 +1,165 @@
+run_id: starvla_wanfastwam_gr1
+run_root_dir: playground/Checkpoints
+seed: 42
+trackers: [jsonl, wandb]
+wandb_entity: jjho1314
+wandb_project: starVLA_Robocasa
+is_debug: false
+
+
+# ============================================================================
+# WanFastWAM × Robocasa Fourier-GR1 — non-joint (fwalign mask) training.
+#
+# Sibling of starvla_wanfastwam_libero_fwalign.yaml. Same WanFastWAM framework
+# but pointed at the Fourier-GR1 lerobot dataset, with action_dim=29 /
+# state_dim=58 / single-cam 224x224 / 16-step action chunk (vs LIBERO's
+# 7 / 8 / dual-cam 224x448 / 32-step).
+#
+# Joint MoT mask is NOT enabled here — defaults to mot_attention_mode="fastwam"
+# (action attends to first-frame video tokens only). This matches the V8 fwalign
+# 97.05 recipe. For the joint variant, copy this yaml and add
+# ``framework.fastwam.mot_attention_mode: joint``.
+# ============================================================================
+
+framework:
+  name: WanFastWAM
+  world_model:
+    base_wm: /data/LFT-W02_data/junjie/weights/Wan2.2-TI2V-5B-Diffusers
+    extract_layers: [-1]
+    # No GR1-specific text cache yet. Set to a precomputed dir to skip the
+    # live T5 forward at training time (saves ~5 GB VRAM, slight speedup).
+    # Generate via ``scripts/precompute_libero_text_embeds.py`` adapted for
+    # the GR1 task descriptions.
+    text_embed_cache_path: null
+    text_prompt_template: "A video recorded from a robot's point of view executing the following instruction: {task}"
+    zero_pad_text_embeds: true
+    force_text_mask_ones: true
+    use_fastwam_aligned_io: true
+    load_text_encoder: true
+    fastwam_checkpoints_root: /data/LFT-W02_data/junjie/VLA_WM/FastWAM/checkpoints
+    redirect_common_files: true
+  qwenvl:
+    base_vlm: /data/LFT-W02_data/junjie/weights/Wan2.2-TI2V-5B-Diffusers
+    vl_hidden_dim: 3072
+    num_vl_layers: 30
+
+  # ActionDiT — Wan22 dims (NOT Cosmos). Pretrained linear-interp warm-start
+  # is built for action_dim=7 (LIBERO); GR1 has action_dim=29 so the input
+  # projection Linear(7->hidden) doesn't match. Must skip_pretrained_load=true
+  # until a GR1-shaped warm-start is generated.
+  action_dit:
+    hidden_dim: 1024
+    action_dim: 29            # GR1 (was 7 for LIBERO)
+    ffn_dim: 4096
+    text_dim: 4096
+    freq_dim: 256
+    num_heads: 24
+    attn_head_dim: 128
+    num_layers: 30
+    eps: 1.0e-6
+    use_gradient_checkpointing: false
+    pretrained_path: null
+    skip_pretrained_load: true   # action_dim mismatch — train ActionDiT from scratch
+
+  # Action chunking + proprio: 16-step horizon (GR1 standard); single proprio.
+  action_model:
+    action_dim: 29
+    state_dim: 58              # GR1 sin/cos-encoded state (was 8 for LIBERO)
+    future_action_window_size: 15   # chunk_len = past + 1 + future = 0 + 1 + 15 = 16
+    past_action_window_size: 0
+    num_inference_steps: 10
+    use_proprio: true
+
+  action_scheduler:
+    num_train_timesteps: 1000
+    train_shift: 5.0
+    infer_shift: 5.0
+  video_scheduler:
+    num_train_timesteps: 1000
+    train_shift: 5.0
+    infer_shift: 5.0
+
+  # Single ego cam (vs LIBERO's 2-cam horizontal concat).
+  image_preprocess:
+    image_height: 224
+    image_width: 224
+    num_cameras: 1
+
+  fastwam:
+    lambda_video: 1.0
+    lambda_action: 1.0
+    enable_video_loss: true
+    video_loss_dtype: bfloat16
+    vae_temporal_factor: 4
+    # mot_attention_mode: fastwam  ← default. Don't set to "joint" for this recipe.
+
+
+datasets:
+  vla_data:
+    dataset_py: lerobot_datasets
+    # NVIDIA's PhysicalAI Robotics GR00T X-Embodiment Sim dataset (Fourier GR1).
+    # Override via env var ``GR1_DATA`` in the launcher.
+    data_root_dir: /data/LFT-W02_data/junjie/data/PhysicalAI-Robotics-GR00T-X-Embodiment-Sim
+    # No GR1 stats file yet. Either:
+    #   (a) generate via scripts/build_fastwam_stats_from_starvla.py (recommended)
+    #   (b) leave null and let the dataloader compute running estimate.
+    fastwam_dataset_stats_path: null
+    # Uses the new fastwam-aligned mixture (9-frame video, 16-step action chunk).
+    # See examples/Robocasa_tabletop/train_files/data_registry/data_config.py.
+    data_mix: fourier_gr1_unified_1000_fastwam
+    balance_dataset_weights: true
+    balance_trajectory_weights: false
+    action_type: delta_ee       # GR1 (LIBERO was delta_qpos)
+    sequential_step_sampling: false
+    default_image_resolution: [3, 224, 224]
+    per_device_batch_size: 4
+    load_all_data_for_training: true
+    obs: ["video.ego_view"]      # GR1 single-cam key (LIBERO was ["image_0"])
+    video_backend: torchvision_av
+    include_state: true
+    # WanFastWAM-specific: emit per-cam list of T PIL frames (consumed by
+    # _build_backbone_images Case 3 path) — required when observation_indices
+    # has length > 1.
+    multi_frame_video: true
+    emit_is_pad: true
+
+
+trainer:
+  num_epochs: null
+  # GR1 dataset is ~30 tasks × 1000 episodes (mixture name says "1000"). With
+  # EFF_BS=128 the per-epoch step count is large; 80k steps is a sensible
+  # starting budget. Adjust based on first run's loss trajectory.
+  max_train_steps: 80000
+  num_warmup_steps: 4000
+  save_interval: 10000
+  eval_interval: 100
+  learning_rate:
+    base: 1.0e-04
+    backbone: 1.0e-04
+    action_expert: 1.0e-04
+    proprio_encoder: 1.0e-04
+  lr_scheduler_type: cosine_with_min_lr
+  scheduler_specific_kwargs:
+    min_lr: 1.0e-06
+  freeze_modules: backbone.vae
+  loss_scale:
+    vla: 1.0
+  max_grad_norm: 1.0
+  warmup_ratio: 0.05
+  weight_decay: 1.0e-02
+  logging_frequency: 100
+  gradient_clipping: 1.0
+  gradient_accumulation_steps: 4   # 8 GPU × bs=4 × accum=4 = 128 effective
+  gradient_checkpointing: false
+
+  optimizer:
+    name: AdamW
+    betas: [0.9, 0.95]
+    eps: 1.0e-08
+    weight_decay: 1.0e-02
+
+  is_resume: false
+  resume_epoch: null
+  resume_step: null
+  enable_gradient_checkpointing: false
+  enable_mixed_precision_training: true

@@ -30,8 +30,8 @@ export PYOPENGL_PLATFORM=egl
 export TOKENIZERS_PARALLELISM=false
 
 HOST=127.0.0.1
-PORTS=(6694 6695)
-GPUS=(0 1)
+PORTS=(6694)
+GPUS=(0)
 N_TRIALS=${N_TRIALS:-50}
 # 10 tasks per suite, 5 workers × 2 tasks each
 N_WORKERS_PER_SUITE=${N_WORKERS_PER_SUITE:-5}
@@ -72,7 +72,7 @@ wait_for_server() {
 }
 
 declare -a SERVER_PIDS=()
-for i in 0 1; do
+for i in 0; do
   pid=$(start_server "${GPUS[$i]}" "${PORTS[$i]}")
   SERVER_PIDS+=("$pid")
 done
@@ -96,9 +96,8 @@ for suite in "${SUITES[@]}"; do
   for w in $(seq 0 $((N_WORKERS_PER_SUITE-1))); do
     s=$((w * TASKS_PER_WORKER))
     e=$(((w+1) * TASKS_PER_WORKER))
-    client_gpu_idx=$((client_idx % 2))
-    port=${PORTS[$client_gpu_idx]}
-    client_gpu=${GPUS[$client_gpu_idx]}
+    port=${PORTS[0]}
+    client_gpu=${GPUS[0]}
     client_idx=$((client_idx+1))
     seed=$((42 + w * 1000 + RANDOM % 100))
     log="${LOG_DIR}/eval_${suite}_w${w}.log"

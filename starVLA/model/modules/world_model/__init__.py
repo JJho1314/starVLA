@@ -22,7 +22,17 @@ def get_world_model(config):
         from ..vlm.CosmosReason2 import _CosmosReason2_Interface
 
         return _CosmosReason2_Interface(config)
-    elif "cosmos-predict2" in wm_name.lower() or "cosmos-predict2" in wm_name.lower():
+    elif "cosmos-predict2" in wm_name.lower():
+        # Two backends route off the same model id:
+        #   - default → CosmoPredict2._CosmoPredict2_Interface
+        #     (feature-extraction interface used by CosmoPredict2GR00T/PI/OFT
+        #      — full monolithic forward, hook-based hidden state capture).
+        #   - use_fastwam_aligned_io=true → CosmoPredict_fastwam
+        #     WanVideoBackboneFastWAMCosmos (joint MoT-compatible wrapper that
+        #     swaps Wan backbone for Cosmos while reusing WanFastWAM framework).
+        if wm_cfg is not None and bool(wm_cfg.get("use_fastwam_aligned_io", False)):
+            from .CosmoPredict_fastwam import WanVideoBackboneFastWAMCosmos
+            return WanVideoBackboneFastWAMCosmos(config=config)
         from .CosmoPredict2 import _CosmoPredict2_Interface
 
         return _CosmoPredict2_Interface(config)

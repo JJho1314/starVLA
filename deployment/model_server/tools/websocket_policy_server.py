@@ -62,6 +62,13 @@ class WebsocketPolicyServer:
             self._port,
             compression=None,
             max_size=None,
+            # Disable keepalive ping/timeout: a synchronous GPU forward (~15s for
+            # GR1) blocks this asyncio loop, so it can't answer pings on the OTHER
+            # queued client connections; with the default 20s ping_timeout those
+            # idle connections drop ("no close frame received"). With many clients
+            # per server that kills the whole eval. None = never auto-close on ping.
+            ping_interval=None,
+            ping_timeout=None,
         ) as server:
             try:
                 if self._idle_timeout > 0:

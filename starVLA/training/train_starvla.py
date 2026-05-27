@@ -90,13 +90,18 @@ def prepare_data(cfg, accelerator, output_dir):
 
 
 def _maybe_split_val_loader(full_loader, cfg):
-    """Hold out a deterministic Subset for validation.
+    """Hold out validation data.
 
-    Picks the held-out indices via a numpy permutation seeded with
-    ``cfg.seed`` so train/val sets are reproducible across runs.
+    When the underlying dataset is ``LeRobotMixtureDataset`` and the
+    per-sub-dataset trajectory holdout was configured at dataset
+    construction time (via ``cfg.datasets.vla_data.val_fraction[_per_dataset]``
+    + ``val_per_subtask``), build the val loader as a shallow-copy of the
+    same dataset with ``set_val_mode(True)``. Train sees no val trajectories
+    and vice versa. The val loader's length is sized at ~val_frac × full
+    length so it covers the held-out pool once per "epoch".
 
-    Returns the original loader unchanged (and ``None``) when no
-    validation budget is configured.
+    Otherwise falls back to a global random Subset (legacy behavior, used
+    by non-mixture datasets).
     """
     val_frac_raw = getattr(cfg.datasets.vla_data, "val_fraction", 0.0)
     val_n_raw = getattr(cfg.datasets.vla_data, "val_num_samples", 0)
@@ -105,22 +110,15 @@ def _maybe_split_val_loader(full_loader, cfg):
     if val_frac <= 0 and val_n <= 0:
         return full_loader, None
 
+    import copy as _copy
     from torch.utils.data import DataLoader, Subset
+
+    from starVLA.dataloader.gr00t_lerobot.datasets import LeRobotMixtureDataset
 
     ds = full_loader.dataset
     n = len(ds)
-    if val_n <= 0:
-        val_n = max(1, int(n * val_frac))
-    # Cap: never let val eat more than 25% of data.
-    val_n = min(val_n, max(1, n // 4))
 
-    seed = int(getattr(cfg, "seed", 42))
-    rng = np.random.default_rng(seed)
-    perm = rng.permutation(n)
-    val_idx = perm[:val_n].tolist()
-    train_idx = perm[val_n:].tolist()
-
-    def _rebuild(subset, shuffle):
+    def _build_loader(dataset, shuffle):
         nw = full_loader.num_workers
         kw = dict(
             batch_size=full_loader.batch_size,
@@ -130,18 +128,56 @@ def _maybe_split_val_loader(full_loader, cfg):
             shuffle=shuffle,
             drop_last=True,
         )
-        # `persistent_workers` / `prefetch_factor` are only valid when num_workers>0.
         if nw > 0:
             kw["persistent_workers"] = getattr(full_loader, "persistent_workers", False)
             pf = getattr(full_loader, "prefetch_factor", None)
             if pf is not None:
                 kw["prefetch_factor"] = pf
-        return DataLoader(subset, **kw)
+        return DataLoader(dataset, **kw)
 
-    train_dl = _rebuild(Subset(ds, train_idx), shuffle=True)
-    val_dl = _rebuild(Subset(ds, val_idx), shuffle=False)
+    if isinstance(ds, LeRobotMixtureDataset) and getattr(ds, "_val_frac", 0.0) > 0:
+        # Per-sub-dataset trajectory holdout: dataset already split val/train
+        # trajectory pools. Build val loader as a shallow-copy with val_mode=True
+        # wrapped by a Subset that sizes val to val_frac × N samples per epoch.
+        val_ds = _copy.copy(ds)
+        val_ds.set_val_mode(True)
+        if val_n <= 0:
+            val_n = max(1, int(n * val_frac))
+        val_n = min(val_n, max(1, n // 4))
+        # Subset indices just count epoch length; sample_step inside picks a
+        # random val trajectory each call (probabilistic, val pool only).
+        val_subset = Subset(val_ds, list(range(val_n)))
+        train_dl = _build_loader(ds, shuffle=True)
+        val_dl = _build_loader(val_subset, shuffle=False)
+        try:
+            per_ds_val = ", ".join(
+                f"{d.dataset_name.split('.')[-1]}:{len(ds._val_traj_indices[i])}/{len(d.trajectory_ids)}"
+                for i, d in enumerate(ds.datasets)
+            )
+        except Exception:
+            per_ds_val = "n/a"
+        logger.info(
+            f"VLA per-subtask val split: val_pool_epoch_len={val_n} / train_pool_epoch_len={n} "
+            f"(~{val_n / max(1,n) * 100:.2f}%); val trajectories per sub-dataset: {per_ds_val}"
+        )
+        return train_dl, val_dl
+
+    # Fallback: global random Subset (token-level holdout, no real trajectory
+    # holdout — used when the dataset is not a LeRobotMixtureDataset).
+    if val_n <= 0:
+        val_n = max(1, int(n * val_frac))
+    val_n = min(val_n, max(1, n // 4))
+
+    seed = int(getattr(cfg, "seed", 42))
+    rng = np.random.default_rng(seed)
+    perm = rng.permutation(n)
+    val_idx = perm[:val_n].tolist()
+    train_idx = perm[val_n:].tolist()
+
+    train_dl = _build_loader(Subset(ds, train_idx), shuffle=True)
+    val_dl = _build_loader(Subset(ds, val_idx), shuffle=False)
     logger.info(
-        f"VLA val split: held out {len(val_idx)} / {n} samples "
+        f"VLA val split (global random fallback): held out {len(val_idx)} / {n} samples "
         f"({len(val_idx) / n * 100:.2f}%); seed={seed}."
     )
     return train_dl, val_dl
@@ -527,20 +563,39 @@ class VLATrainer(TrainerUtils):
         dataloader was built in :func:`prepare_data`. Costs one extra
         forward per ``val_num_batches`` batches per ``val_interval`` steps —
         no backward, no optimizer step.
+
+        Two metric families are emitted:
+
+          * ``val/<loss_name>``  — training-mode forward losses
+            (e.g. ``val/action_loss``, ``val/video_loss``). Same units as
+            train losses → directly comparable for overfitting detection.
+
+          * ``val/mse_score``    — euclidean distance between
+            ``predict_action()``'s output and ground-truth actions,
+            normalised by number of action elements. Mirrors the train-side
+            ``mse_score`` from :meth:`eval_action_model` but evaluated on the
+            held-out split. Computed on the first ``val_num_mse_batches``
+            batches of the val pass (default 2) since ``predict_action`` is
+            multi-step denoising and ~3-5× slower than ``forward()``.
+            Disable by setting ``trainer.val_num_mse_batches: 0``.
         """
         if self.vla_val_dataloader is None:
             return {}
 
         num_batches = int(getattr(self.config.trainer, "val_num_batches", 8) or 8)
+        num_mse_batches = int(getattr(self.config.trainer, "val_num_mse_batches", 2) or 0)
         was_training = self.model.training
         self.model.eval()
 
         sums_cpu: dict[str, float] = {}    # CPU floats, easier to gather_object
         n_batches_seen = 0
+        mse_sum = 0.0
+        mse_n = 0
 
         val_iter = iter(self.vla_val_dataloader)
+        unwrapped = self.accelerator.unwrap_model(self.model)
         with torch.no_grad():
-            for _ in range(num_batches):
+            for batch_idx in range(num_batches):
                 try:
                     batch = next(val_iter)
                 except StopIteration:
@@ -550,23 +605,50 @@ class VLATrainer(TrainerUtils):
                     except StopIteration:
                         break
 
+                # 1) Training-mode forward → loss dict.
                 with torch.autocast("cuda", dtype=torch.bfloat16):
-                    out = self.accelerator.unwrap_model(self.model).forward(batch)
-
+                    out = unwrapped.forward(batch)
                 for k, v in out.items():
                     if not (k.endswith("_loss") and isinstance(v, torch.Tensor)):
                         continue
                     sums_cpu[k] = sums_cpu.get(k, 0.0) + float(v.detach().float().item())
                 n_batches_seen += 1
 
+                # 2) Inference predict_action → mse on first `num_mse_batches`.
+                if batch_idx < num_mse_batches:
+                    try:
+                        actions = np.array([ex["action"] for ex in batch])
+                        pred = unwrapped.predict_action(
+                            examples=batch, use_ddim=True, num_ddim_steps=20,
+                        )
+                        normalized_actions = np.asarray(pred["normalized_actions"])
+                        num_elems = float(np.prod(actions.shape))
+                        score = TrainerUtils.euclidean_distance(normalized_actions, actions)
+                        mse_sum += float(score) / max(num_elems, 1.0)
+                        mse_n += 1
+                    except Exception as e:
+                        import traceback as _tb
+                        logger.warning(
+                            f"val mse skipped (batch {batch_idx}): "
+                            f"{type(e).__name__}: {e}\n{_tb.format_exc()}",
+                            main_process_only=False,
+                        )
+
         if was_training:
             self.model.train()
 
-        # Collect per-rank (sums, count) at rank 0 — gather_object handles ranks
-        # that saw different loss key sets without deadlocking on collective ops.
+        # Collect per-rank (sums, count, mse_sum, mse_n) at rank 0 via
+        # gather_object — handles ranks that saw different loss key sets
+        # without deadlocking on collective ops.
         all_sums = self.accelerator.gather_for_metrics([sums_cpu], use_gather_object=True)
         all_counts = self.accelerator.gather_for_metrics(
             [int(n_batches_seen)], use_gather_object=True
+        )
+        all_mse_sum = self.accelerator.gather_for_metrics(
+            [float(mse_sum)], use_gather_object=True
+        )
+        all_mse_n = self.accelerator.gather_for_metrics(
+            [int(mse_n)], use_gather_object=True
         )
 
         if not self.accelerator.is_main_process:
@@ -586,6 +668,12 @@ class VLATrainer(TrainerUtils):
         }
         if out_metrics:
             out_metrics["val/total_loss"] = float(sum(out_metrics.values()))
+
+        # val/mse_score — only emit when at least one batch successfully ran.
+        total_mse_n = int(sum(all_mse_n))
+        if total_mse_n > 0:
+            out_metrics["val/mse_score"] = float(sum(all_mse_sum)) / total_mse_n
+
         return out_metrics
 
     def eval_action_model(self, step_metrics: dict = None) -> float:

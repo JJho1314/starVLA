@@ -2301,6 +2301,59 @@ class LeRobotMixtureDataset(Dataset):
             
             self._trajectory_sampling_weights.append(trajectory_sampling_weights)
 
+        # 3b. Per-sub-dataset val/train holdout (true trajectory-level split).
+        # When data_cfg.val_fraction_per_dataset > 0 (or val_fraction > 0 when
+        # val_per_subtask is not False), each sub-dataset's trajectories are
+        # deterministically partitioned into val (~frac) and train (~1-frac).
+        # Train mode samples only from train trajectories; val mode (toggled
+        # via set_val_mode(True)) samples only from val trajectories. The
+        # dataset-level sampling weights are unchanged in either mode.
+        val_frac = 0.0
+        if self.data_cfg is not None:
+            v1 = self.data_cfg.get("val_fraction_per_dataset", None)
+            if v1 is None:
+                v_legacy = self.data_cfg.get("val_fraction", 0.0)
+                use_per = self.data_cfg.get("val_per_subtask", True)
+                if v_legacy and use_per not in (False, "False"):
+                    val_frac = float(v_legacy)
+            else:
+                val_frac = float(v1)
+        self._val_frac = val_frac
+        self._val_mode = False
+        self._val_traj_indices: list[set] = [set() for _ in self.datasets]
+        self._train_traj_weights: list[np.ndarray] = [w.copy() for w in self._trajectory_sampling_weights]
+        self._val_traj_weights: list[np.ndarray] = [np.zeros_like(w) for w in self._trajectory_sampling_weights]
+        if val_frac > 0:
+            split_rng = np.random.default_rng(int(self.seed))
+            for i, dataset in enumerate(self.datasets):
+                n_traj = len(dataset.trajectory_ids)
+                # at least 1 val trajectory; cap at n_traj-1 so train is nonempty
+                n_val = max(1, int(round(n_traj * val_frac)))
+                n_val = min(n_val, max(1, n_traj - 1))
+                val_idx = split_rng.choice(n_traj, size=n_val, replace=False)
+                self._val_traj_indices[i] = set(int(j) for j in val_idx)
+                wt = self._trajectory_sampling_weights[i]
+                # train weights: zero out val trajectories, renormalize
+                wt_train = wt.copy()
+                wt_train[list(self._val_traj_indices[i])] = 0.0
+                s = wt_train.sum()
+                wt_train = wt_train / s if s > 0 else wt_train
+                self._train_traj_weights[i] = wt_train
+                # val weights: zero out non-val trajectories, renormalize
+                wt_val = np.zeros_like(wt)
+                wt_val[list(self._val_traj_indices[i])] = wt[list(self._val_traj_indices[i])]
+                s = wt_val.sum()
+                wt_val = wt_val / s if s > 0 else wt_val
+                self._val_traj_weights[i] = wt_val
+            print(
+                f"[mixture-val-split] val_fraction_per_dataset={val_frac:.4f} | "
+                f"per-dataset val/total trajectories: " +
+                ", ".join(
+                    f"{ds.dataset_name.split('.')[-1]}:{len(self._val_traj_indices[i])}/{len(ds.trajectory_ids)}"
+                    for i, ds in enumerate(self.datasets)
+                )
+            )
+
         # 4. Primary dataset indices
         self._primary_dataset_indices = np.array(dataset_sampling_weights) == 1.0
         if not np.any(self._primary_dataset_indices):
@@ -2348,8 +2401,17 @@ class LeRobotMixtureDataset(Dataset):
 
     @property
     def trajectory_sampling_weights(self) -> list[np.ndarray]:
-        """The sampling weights for each trajectory in each dataset."""
+        """The sampling weights for each trajectory in each dataset.
+
+        When the per-sub-dataset val split is configured, this returns the
+        active (train- or val-mode) weights rather than the raw weights.
+        """
+        if self._val_frac > 0:
+            return self._val_traj_weights if self._val_mode else self._train_traj_weights
         return self._trajectory_sampling_weights
+
+    def set_val_mode(self, val_mode: bool) -> None:
+        self._val_mode = bool(val_mode)
 
     @property
     def primary_dataset_indices(self) -> np.ndarray:

@@ -87,6 +87,13 @@ class WanMetaQueryFastWAMDefaultConfig(WanFastWAMDefaultConfig):
             "connector_ffn_mult": 4,
             "connector_rope_theta": 1_000_000.0,  # Qwen3 default; MetaQuery used Qwen2 default (1e4)
             "rms_init": 1.0,
+            # If True, the VLM query tokens REPLACE the UMT5 text embeds as the
+            # sole cross-attention conditioning (no T5 concat). This mirrors the
+            # original MetaQuery setup where the connector output IS the caption
+            # embedding — there is no competing text encoder for the (trainable)
+            # cross-attn to fall back on, so the model is forced to use the VLM
+            # signal instead of learning to ignore it. Default False (concat).
+            "vlm_only_conditioning": False,
         }
     )
 
@@ -289,6 +296,12 @@ class WanMetaQueryFastWAM(Wan_FastWAM):
 
         _orig = self.backbone.build_inputs
 
+        import os as _os
+
+        _vlm_only = bool(self.config.framework.vlm.get("vlm_only_conditioning", False))
+        if _vlm_only:
+            logger.info("WanMetaQueryFastWAM: vlm_only_conditioning=True — VLM queries REPLACE T5 as sole cross-attn context.")
+
         def _wrapped(images, instructions, image_height=None, image_width=None, **kw):
             wm_inputs = _orig(
                 images, instructions,
@@ -301,12 +314,36 @@ class WanMetaQueryFastWAM(Wan_FastWAM):
                 text_mask = torch.ones(
                     text.shape[:2], dtype=torch.bool, device=text.device
                 )
-            wm_inputs["encoder_hidden_states"] = torch.cat(
-                [text, vlm_ctx.to(text.dtype)], dim=1
-            )
-            wm_inputs["encoder_attention_mask"] = torch.cat(
-                [text_mask, vlm_mask.to(text_mask.device)], dim=1
-            )
+
+            # Diagnostic ablation: at inference, set WAN_METAQ_ABLATION to study
+            # whether the VLM signal is actually being used by downstream cross-
+            # attention. Three modes:
+            #   "mask" — keep VLM tokens in KV sequence but set their attention
+            #            mask to False; softmax assigns 0 weight, so the model
+            #            sees identical compute graph but cannot use VLM info.
+            #   "zero" — set vlm_ctx to all zeros (V(zeros)=bias still leaks,
+            #            so this is weaker than "mask"; use for sanity check).
+            #   ""     — production path, no ablation.
+            _ablation = _os.environ.get("WAN_METAQ_ABLATION", "").strip().lower()
+            if _ablation in ("mask", "1"):
+                vlm_mask = torch.zeros_like(vlm_mask)
+            elif _ablation == "zero":
+                vlm_ctx = torch.zeros_like(vlm_ctx)
+
+            if _vlm_only:
+                # VLM queries are the SOLE cross-attn conditioning (no T5 concat).
+                # Mirrors original MetaQuery: connector output replaces the text
+                # caption embedding, so the trainable cross-attn has no T5 to fall
+                # back on and is forced to use the VLM signal.
+                wm_inputs["encoder_hidden_states"] = vlm_ctx.to(text.dtype)
+                wm_inputs["encoder_attention_mask"] = vlm_mask.to(text_mask.device)
+            else:
+                wm_inputs["encoder_hidden_states"] = torch.cat(
+                    [text, vlm_ctx.to(text.dtype)], dim=1
+                )
+                wm_inputs["encoder_attention_mask"] = torch.cat(
+                    [text_mask, vlm_mask.to(text_mask.device)], dim=1
+                )
             return wm_inputs
 
         # Bypass any attribute setter that backbone might have.
@@ -349,7 +386,13 @@ class WanMetaQueryFastWAM(Wan_FastWAM):
         ).to(self.vlm.device)
 
         # Forward (gradients flow only through new token embedding rows + connector).
-        use_grad = any(p.requires_grad for p in self.vlm.parameters())
+        # Gate enable_grad by self.training: at inference (.eval(), self.training=False)
+        # we MUST use no_grad. Without this, a trained ckpt has requires_grad=True on
+        # the new embed rows, so use_grad stayed True at inference → torch.enable_grad()
+        # inside predict_action's @inference_mode built/retained autograd state through
+        # the 4B Qwen3-VL forward every call → GPU memory accumulated → server OOM-crashed
+        # after ~5 min of eval. Forcing no_grad at inference stops the leak.
+        use_grad = self.training and any(p.requires_grad for p in self.vlm.parameters())
         ctx_mgr = torch.enable_grad() if use_grad else torch.no_grad()
         with ctx_mgr, torch.autocast("cuda", dtype=torch.bfloat16):
             out = self.vlm(

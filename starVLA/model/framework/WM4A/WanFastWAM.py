@@ -775,6 +775,14 @@ class Wan_FastWAM(baseframework):
         if state_t is not None:
             state_t = self._normalize_state(state_t)
         text_embeds, text_mask = self._inject_proprio(text_embeds, text_mask, state_t)
+        # Video prefill must condition on the SAME text+proprio context as training:
+        # _joint_training_loss feeds the proprio-injected `ctx` to the video pre_dit,
+        # so the action expert attends to video K/V built with proprio. Without writing
+        # the injected context back here, _prefill_video_cache would use text-only
+        # context (wm_inputs["encoder_hidden_states"]), shifting the video tokens and
+        # collapsing closed-loop action quality.
+        wm_inputs["encoder_hidden_states"] = text_embeds
+        wm_inputs["encoder_attention_mask"] = text_mask
         device = text_embeds.device
 
         # Initialize action latents from N(0, 1).
